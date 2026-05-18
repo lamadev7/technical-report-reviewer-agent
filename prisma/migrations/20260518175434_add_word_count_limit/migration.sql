@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Report" ADD COLUMN     "wordCountLimit" INTEGER NOT NULL DEFAULT 10000;

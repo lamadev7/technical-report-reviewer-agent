@@ -1,0 +1,116 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ReviewMode {
+  STRICT
+  MODERATE
+  ACCEPTABLE
+}
+
+enum Severity {
+  CRITICAL
+  MAJOR
+}
+
+enum IssueCategory {
+  GRAMMAR
+  FORMAT
+  COMPLETENESS
+  SECTION_QUALITY
+  OTHER
+}
+
+enum IssueSource {
+  AGENT
+  REVIEWER
+  RULE
+}
+
+enum ReportStatus {
+  UPLOADED
+  REVIEWING
+  REVIEWED
+  APPROVED
+  SENT
+}
+
+enum SampleQuality {
+  EXCELLENT
+  BAD
+}
+
+model Report {
+  id            String       @id @default(cuid())
+  filename      String
+  originalPath  String
+  htmlContent   String
+  plainText     String
+  offsetMap     Json
+  studentName   String?
+  studentEmail  String?
+  reviewMode    ReviewMode   @default(MODERATE)
+  markingMode   ReviewMode   @default(MODERATE)
+  marking       Json?
+  status        ReportStatus @default(UPLOADED)
+  templateId    String?
+  template      KbTemplate?  @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  enabledSkills String[]     @default([])
+  reviewStartedAt DateTime?
+  reviewProgress  Json?
+  wordCountLimit  Int          @default(10000)
+  issues        Issue[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([studentName])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Issue {
+  id               String        @id @default(cuid())
+  reportId         String
+  report           Report        @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  startOffset      Int
+  endOffset        Int
+  anchorPath       String?
+  quotedText       String
+  severity         Severity
+  category         IssueCategory
+  shortDescription String
+  source           IssueSource   @default(AGENT)
+  deleted          Boolean       @default(false)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  @@index([reportId])
+}
+
+model KbTemplate {
+  id          String   @id @default(cuid())
+  name        String
+  filePath    String
+  htmlContent String
+  plainText   String
+  reports     Report[]
+  createdAt   DateTime @default(now())
+}
+
+model KbSample {
+  id          String        @id @default(cuid())
+  name        String
+  quality     SampleQuality
+  filePath    String
+  htmlContent String
+  plainText   String
+  summary     String?
+  createdAt   DateTime      @default(now())
+
+  @@index([quality])
+}

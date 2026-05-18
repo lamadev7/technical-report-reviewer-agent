@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local storage (uploaded reports, screenshots)
+/storage/*
+!/storage/.gitkeep
+
+# prisma
+/prisma/migrations/dev/
