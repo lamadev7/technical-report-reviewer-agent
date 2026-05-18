@@ -653,17 +653,29 @@ function ReviewProgress({ elapsed, issues, progress }: { elapsed: number; issues
   const ruleCount = progress?.ruleCount ?? issues.filter((i) => i.source === "RULE").length;
   const agentCount = progress?.agentCount ?? issues.filter((i) => i.source === "AGENT").length;
   const stage = progress?.message || stageLabel(progress?.stage, elapsed, agentCount);
-  const expected = 120;
-  const pct = Math.min(95, Math.round((elapsed / expected) * 100));
+
+  // Stage-driven progress so the bar reflects WHERE we are, not just how long
+  // we've waited. Each stage gets a band; within the band the bar nudges
+  // forward with elapsed so users still see motion during long Claude calls.
+  const band = stageBand(progress?.stage);
+  const within = Math.min(1, (elapsed % 60) / 60); // soft 0..1 sweep each minute
+  const pct = Math.round(band.start + (band.end - band.start) * within);
+
   return (
     <div className="bg-blue-50 border-b border-blue-200 px-4 py-2 text-sm flex items-center gap-4">
       <div className="flex-1">
         <div className="flex items-center gap-2 mb-1">
           <span className="font-medium text-blue-900">{stage}</span>
-          <span className="text-xs text-blue-700">{elapsed}s elapsed · expected 60–180s</span>
+          <span className="text-xs text-blue-700">
+            {elapsed}s elapsed · {band.label}
+            {progress?.stage === "marking-running" || progress?.stage === "agent-running"
+              ? " — still working (Claude can take 60–180s per call)"
+              : ""}
+          </span>
         </div>
-        <div className="h-1.5 bg-blue-100 rounded overflow-hidden">
+        <div className="h-1.5 bg-blue-100 rounded overflow-hidden relative">
           <div className="h-full bg-blue-500 transition-all" style={{ width: `${pct}%` }} />
+          <div className="absolute inset-0 bg-gradient-to-r from-transparent via-blue-400/40 to-transparent animate-[pulse_2s_ease-in-out_infinite]" />
         </div>
       </div>
       <div className="flex items-center gap-3 text-xs">
@@ -676,6 +688,19 @@ function ReviewProgress({ elapsed, issues, progress }: { elapsed: number; issues
       </div>
     </div>
   );
+}
+
+function stageBand(stage: ReviewProgress["stage"] | undefined): { start: number; end: number; label: string } {
+  switch (stage) {
+    case "starting":         return { start: 2,  end: 10, label: "queued" };
+    case "rules-done":       return { start: 10, end: 20, label: "rule pass done" };
+    case "agent-running":    return { start: 20, end: 65, label: "semantic review in progress" };
+    case "agent-done":       return { start: 65, end: 72, label: "issues saved" };
+    case "marking-running":  return { start: 72, end: 95, label: "computing marks" };
+    case "reviewed":         return { start: 100, end: 100, label: "done" };
+    case "failed":           return { start: 100, end: 100, label: "failed" };
+    default:                 return { start: 5,  end: 30, label: "starting" };
+  }
 }
 
 function RefreshIcon({ spinning }: { spinning?: boolean }) {

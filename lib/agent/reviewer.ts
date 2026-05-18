@@ -6,6 +6,30 @@ import { buildSkillsSection, defaultSkillIds } from "./skills";
 import { ReviewOutputSchema, MarkingOutputSchema, reviewToolSchema, markingToolSchema } from "./schema";
 import { publish, type ReviewProgress } from "./reviewBus";
 
+// Tokens for fuzzy matching. Strips punctuation, lowercases, collapses
+// whitespace. A new finding is considered a duplicate of a dismissed one when
+// its quotedText shares a significant prefix OR its shortDescription matches
+// closely after normalization.
+function normalize(s: string): string {
+  return s.replace(/\s+/g, " ").replace(/[^\p{L}\p{N}\s]/gu, "").trim().toLowerCase();
+}
+
+function isDismissedDuplicate(
+  candidate: { quotedText: string; shortDescription: string },
+  dismissed: Array<{ quotedText: string; shortDescription: string }>,
+): boolean {
+  const q = normalize(candidate.quotedText).slice(0, 60);
+  const d = normalize(candidate.shortDescription);
+  if (!q && !d) return false;
+  for (const old of dismissed) {
+    const oq = normalize(old.quotedText).slice(0, 60);
+    const od = normalize(old.shortDescription);
+    if (q && oq && (q === oq || q.startsWith(oq) || oq.startsWith(q))) return true;
+    if (d && od && d === od) return true;
+  }
+  return false;
+}
+
 async function setProgress(reportId: string, progress: ReviewProgress) {
   await prisma.report.update({ where: { id: reportId }, data: { reviewProgress: progress as any } });
   publish(reportId, progress);
@@ -100,8 +124,19 @@ async function runReview(reportId: string) {
     });
     publish(reportId, { stage: "starting", startedAt: startedAt.toISOString() });
   }
-  // Clear prior AGENT issues for this report so a re-run is idempotent.
-  await prisma.issue.deleteMany({ where: { reportId, source: "AGENT" } });
+  // Snapshot issues the reviewer previously dismissed (soft-deleted) BEFORE
+  // we drop the live AGENT rows. We use these to (a) tell Claude not to
+  // re-flag them and (b) auto-dismiss any matching findings the next run
+  // produces, so the human reviewer doesn't have to delete the same item twice.
+  const dismissedIssues = await prisma.issue.findMany({
+    where: { reportId, deleted: true },
+    select: { quotedText: true, shortDescription: true, category: true, severity: true, source: true },
+    take: 200,
+  });
+
+  // Clear prior LIVE AGENT issues so a re-run is idempotent. Soft-deleted
+  // rows (deleted=true) are intentionally preserved as the dismissal record.
+  await prisma.issue.deleteMany({ where: { reportId, source: "AGENT", deleted: false } });
 
   // Already-flagged issues from the deterministic rule pass — pass them to the
   // LLM as context so it focuses on semantic findings instead of re-reporting
@@ -116,6 +151,13 @@ async function runReview(reportId: string) {
         .map((i, n) => `${n + 1}. [${i.category}] "${i.quotedText.slice(0, 60)}" — ${i.shortDescription}`)
         .join("\n")
     : "(no rule-based findings)";
+
+  const dismissedBlob = dismissedIssues.length
+    ? dismissedIssues
+        .map((i, n) => `${n + 1}. [${i.category}] "${i.quotedText.slice(0, 80)}" — ${i.shortDescription}`)
+        .join("\n")
+    : "(none)";
+  const dismissedContext = `Previously dismissed issues (the reviewer explicitly deleted these on a prior pass — DO NOT re-report them or any near-duplicate. Even if the same span looks problematic, skip it):\n${dismissedBlob}`;
 
   await setProgress(reportId, {
     stage: "agent-running",
@@ -133,6 +175,7 @@ async function runReview(reportId: string) {
       `Templates the report must follow:\n\n${templatesBlob || "(no templates provided)"}`,
       `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`,
       `Already-flagged issues from automated checks (DO NOT re-report these — focus on semantic problems they miss):\n${ruleBlob}`,
+      dismissedContext,
       `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}`,
       `\nReturn JSON only matching the schema. No prose, no markdown fences.`,
     ].join("\n\n");
@@ -161,7 +204,14 @@ async function runReview(reportId: string) {
       stopReviewTicker();
     }
     const parsed = ReviewOutputSchema.parse(parsedCli);
-    const issueRecords = parsed.issues.map((iss) => {
+    const dedupedCli = parsed.issues.filter(
+      (iss) =>
+        !isDismissedDuplicate(
+          { quotedText: iss.quotedText, shortDescription: iss.shortDescription },
+          dismissedIssues,
+        ),
+    );
+    const issueRecords = dedupedCli.map((iss) => {
       let start = report.plainText.indexOf(iss.quotedText);
       if (start < 0) {
         const norm = iss.quotedText.replace(/\s+/g, " ").trim();
@@ -277,6 +327,7 @@ async function runReview(reportId: string) {
             { type: "text", text: `Templates the report must follow:\n\n${templatesBlob || "(no templates provided)"}`, cache_control: { type: "ephemeral" } },
             { type: "text", text: `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`, cache_control: { type: "ephemeral" } },
             { type: "text", text: `Already-flagged issues from automated checks (DO NOT re-report — focus on semantic findings these miss):\n${ruleBlob}` },
+            { type: "text", text: dismissedContext },
             { type: "text", text: `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}` },
           ],
         },
@@ -290,9 +341,20 @@ async function runReview(reportId: string) {
   if (!reviewBlock || reviewBlock.type !== "tool_use") throw new Error("Claude did not call report_issues tool");
   const parsed = ReviewOutputSchema.parse(reviewBlock.input);
 
+  // Drop any finding Claude re-surfaced that the reviewer previously deleted
+  // — keeps dismissals sticky across reruns, even when token-saving prompt
+  // hints failed to convince the model.
+  const dedupedSdk = parsed.issues.filter(
+    (iss) =>
+      !isDismissedDuplicate(
+        { quotedText: iss.quotedText, shortDescription: iss.shortDescription },
+        dismissedIssues,
+      ),
+  );
+
   // Snap offsets to actual occurrences of quotedText in report.plainText for higher accuracy
   const text = report.plainText;
-  const issueRecords = parsed.issues.map((iss) => {
+  const issueRecords = dedupedSdk.map((iss) => {
     let start = text.indexOf(iss.quotedText);
     if (start < 0) {
       const norm = iss.quotedText.replace(/\s+/g, " ").trim();
