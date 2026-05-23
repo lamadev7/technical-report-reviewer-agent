@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { remove } from "@/lib/storage";
+import { ensureTemplateMarkingScheme } from "@/lib/agent/markingScheme";
+import { recomputeMarking } from "@/lib/agent/marking";
 
 export const runtime = "nodejs";
 
@@ -23,10 +25,30 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
   if (body.status) patch.status = body.status;
   if ("templateId" in body) patch.templateId = body.templateId || null;
   if (Array.isArray(body.enabledSkills)) patch.enabledSkills = body.enabledSkills;
-  if (typeof body.wordCountLimit === "number" && body.wordCountLimit >= 0) {
-    patch.wordCountLimit = Math.floor(body.wordCountLimit);
+  if ("studentEmail" in body) {
+    const e = typeof body.studentEmail === "string" ? body.studentEmail.trim() : "";
+    if (e && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+      return NextResponse.json({ error: "Invalid email" }, { status: 400 });
+    }
+    patch.studentEmail = e || null;
+  }
+  if (typeof body.wordCountMin === "number" && body.wordCountMin >= 0) {
+    patch.wordCountMin = Math.floor(body.wordCountMin);
+  }
+  if (typeof body.wordCountMax === "number" && body.wordCountMax >= 0) {
+    patch.wordCountMax = Math.floor(body.wordCountMax);
   }
   const updated = await prisma.report.update({ where: { id }, data: patch });
+  // When the template selection changes, make sure that template has a
+  // persisted marking scheme and recompute the report's marking against it.
+  if ("templateId" in patch && updated.templateId) {
+    try {
+      await ensureTemplateMarkingScheme(updated.templateId);
+      await recomputeMarking(id);
+    } catch (e: any) {
+      console.warn("template scheme / recompute failed:", e?.message || e);
+    }
+  }
   return NextResponse.json(updated);
 }
 

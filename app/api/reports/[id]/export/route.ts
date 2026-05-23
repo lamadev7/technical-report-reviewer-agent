@@ -13,6 +13,8 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
   });
   if (!report) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
+  const wordCount = (report.plainText.match(/\b[\p{L}\p{N}']+\b/gu) || []).length;
+
   const pdf = await exportReviewPdf({
     filename: report.filename,
     studentName: report.studentName,
@@ -21,6 +23,9 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     reviewMode: report.reviewMode,
     markingMode: report.markingMode,
     marking: (report.marking as any) ?? null,
+    wordCount,
+    wordCountMin: report.wordCountMin,
+    wordCountMax: report.wordCountMax,
     issues: report.issues.map((i) => ({
       startOffset: i.startOffset,
       endOffset: i.endOffset,

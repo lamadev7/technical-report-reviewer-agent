@@ -28,6 +28,13 @@ export async function POST(req: NextRequest) {
   const relPath = await save("reports", file.name, buf);
   const header = extractHeader(ingested.plainText);
 
+  // Default-select the most-recently-uploaded template so a new report has a
+  // valid scheme target out of the box. The reviewer can still switch later.
+  const defaultTemplate = await prisma.kbTemplate.findFirst({
+    orderBy: { createdAt: "desc" },
+    select: { id: true },
+  });
+
   const report = await prisma.report.create({
     data: {
       filename: file.name,
@@ -39,6 +46,7 @@ export async function POST(req: NextRequest) {
       studentEmail: header.studentEmail,
       reviewMode: reviewMode as any,
       markingMode: markingMode as any,
+      templateId: defaultTemplate?.id ?? null,
     },
     select: { id: true },
   });
@@ -51,6 +59,8 @@ export async function POST(req: NextRequest) {
       plainText: ingested.plainText,
       filename: file.name,
       templates,
+      wordCountMin: 0,
+      wordCountMax: 0,
     });
     if (ruleIssues.length) {
       await prisma.issue.createMany({

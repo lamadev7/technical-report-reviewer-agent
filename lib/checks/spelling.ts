@@ -1,18 +1,38 @@
 import type { Check, RuleIssue } from "./types";
 
-let spellerPromise: Promise<any> | null = null;
+let spellersPromise: Promise<any[]> | null = null;
 
-async function loadSpeller(): Promise<any> {
-  if (!spellerPromise) {
-    spellerPromise = (async () => {
-      const [{ default: nspell }, { default: dict }] = await Promise.all([
+async function loadSpellers(): Promise<any[]> {
+  if (!spellersPromise) {
+    spellersPromise = (async () => {
+      const [{ default: nspell }, { default: dictUS }, { default: dictGB }] = await Promise.all([
         import("nspell"),
         import("dictionary-en"),
+        import("dictionary-en-gb"),
       ]);
-      return nspell(dict);
+      return [nspell(dictUS), nspell(dictGB)];
     })();
   }
-  return spellerPromise;
+  return spellersPromise;
+}
+
+function correctInAnyDict(spellers: any[], token: string): boolean {
+  return spellers.some((s) => s.correct(token));
+}
+
+function suggestFromAny(spellers: any[], token: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of spellers) {
+    for (const sug of s.suggest(token)) {
+      if (!seen.has(sug)) {
+        seen.add(sug);
+        out.push(sug);
+        if (out.length >= 3) return out;
+      }
+    }
+  }
+  return out;
 }
 
 const SKIP = new Set([
@@ -36,14 +56,8 @@ const SKIP = new Set([
   "bibliographies", "citation", "citations",
 ]);
 
-function isLikelyProperNoun(token: string, isSentenceStart: boolean): boolean {
-  // Skip tokens whose first letter is capital and not at sentence start.
-  if (isSentenceStart) return false;
-  return /^[A-Z][a-z]+/.test(token);
-}
-
 export const spellingCheck: Check = async ({ plainText }) => {
-  const speller = await loadSpeller();
+  const spellers = await loadSpellers();
   const issues: RuleIssue[] = [];
 
   const sentences = plainText.split(/(?<=[.!?])\s+/);
@@ -54,38 +68,37 @@ export const spellingCheck: Check = async ({ plainText }) => {
     const sentenceStart = plainText.indexOf(sentence, cursor);
     cursor = sentenceStart < 0 ? cursor : sentenceStart + sentence.length;
     const tokens = sentence.match(/\b[A-Za-z][A-Za-z']{2,}\b/g) || [];
-    let isFirst = true;
-    for (const raw of tokens) {
-      const token = raw;
+    for (const token of tokens) {
       const lower = token.toLowerCase();
-      const wasFirst = isFirst;
-      isFirst = false;
-      if (lower.length < 4) continue;
+      // Short tokens are mostly PDF-extraction fragments ("nomy" from "astronomy")
+      // or unhelpful 4-letter typos that produce more noise than signal.
+      if (lower.length < 5) continue;
       if (SKIP.has(lower)) continue;
       if (/^\d/.test(token)) continue;
-      // ALL-CAPS = acronym (RBAC, WebRTC handled too via mixed-case rule below)
+      // ALL-CAPS = acronym
       if (/^[A-Z]{2,}$/.test(token)) continue;
-      // CamelCase / studlyCaps tokens (e.g. WebRTC, MongoDB) — almost always
-      // product/library names that no general dict covers.
+      // CamelCase / studlyCaps = product/library names
       if (/[A-Z]/.test(token.slice(1))) continue;
-      if (isLikelyProperNoun(token, wasFirst)) continue;
-      if (speller.correct(token)) continue;
-      // Report each unique misspelling once — repeats are noise.
+      // Any first-letter-cap = treat as proper noun. Trades catching "Recieve"
+      // at sentence start for not flagging "Gantt", "Kubernetes", surnames, etc.
+      if (/^[A-Z]/.test(token)) continue;
+      if (correctInAnyDict(spellers, token)) continue;
       if (seen.has(lower)) continue;
       seen.set(lower, 1);
 
+      const suggestions = suggestFromAny(spellers, token);
+      // No plausible suggestion → likely an OCR/PDF fragment, not a misspelling.
+      if (suggestions.length === 0) continue;
+
       const tokenStart = plainText.indexOf(token, sentenceStart >= 0 ? sentenceStart : 0);
       if (tokenStart < 0) continue;
-      const suggestions = speller.suggest(token).slice(0, 3);
       issues.push({
         startOffset: tokenStart,
         endOffset: tokenStart + token.length,
         quotedText: token,
         severity: "MAJOR",
         category: "GRAMMAR",
-        shortDescription:
-          `Likely misspelling: "${token}"` +
-          (suggestions.length ? ` — try ${suggestions.join(", ")}` : ""),
+        shortDescription: `Likely misspelling: "${token}" — try ${suggestions.join(", ")}`,
       });
       if (issues.length >= 40) return issues;
     }

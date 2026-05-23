@@ -1,11 +1,13 @@
 import type { Check, CheckContext, RuleIssue } from "./types";
 import { wordCountCheck } from "./wordCount";
 import { requiredSectionsCheck } from "./requiredSections";
-import { spellingCheck } from "./spelling";
-import { styleCheck } from "./style";
 import { sectionDepthCheck } from "./sectionDepth";
 
-const CHECKS: Check[] = [wordCountCheck, requiredSectionsCheck, sectionDepthCheck, spellingCheck, styleCheck];
+// Spelling + style are handled by the agent's grammar-prose skill so findings
+// are sentence-context aware. Dictionary-based rules produced too many false
+// positives (PDF fragments like "gement"/"ertainty", valid words like
+// "biometric"/"technologic", surnames, words used correctly in context).
+const CHECKS: Check[] = [wordCountCheck, requiredSectionsCheck, sectionDepthCheck];
 
 export async function runAllChecks(ctx: CheckContext): Promise<RuleIssue[]> {
   const results = await Promise.all(

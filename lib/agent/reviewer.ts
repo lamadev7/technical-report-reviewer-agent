@@ -4,7 +4,9 @@ import { runClaudeCliJson, claudeCliAvailable, ClaudeCliError } from "./cli";
 import { REVIEW_SYSTEM_BASE, rubricFor, MARKING_SYSTEM_BASE, markingRubricFor, type Mode } from "./prompts";
 import { buildSkillsSection, defaultSkillIds } from "./skills";
 import { ReviewOutputSchema, MarkingOutputSchema, reviewToolSchema, markingToolSchema } from "./schema";
-import { publish, type ReviewProgress } from "./reviewBus";
+import { publish, registerAbort, clearAbort, type ReviewProgress } from "./reviewBus";
+import { applyPassiveDeletionPenalty } from "./marking";
+import { buildLearnedRejectionBlob } from "./learning";
 
 // Tokens for fuzzy matching. Strips punctuation, lowercases, collapses
 // whitespace. A new finding is considered a duplicate of a dismissed one when
@@ -31,8 +33,20 @@ function isDismissedDuplicate(
 }
 
 async function setProgress(reportId: string, progress: ReviewProgress) {
-  await prisma.report.update({ where: { id: reportId }, data: { reviewProgress: progress as any } });
-  publish(reportId, progress);
+  // Preserve preflight `steps` written by the review/route.ts so subsequent
+  // agent/marking stage updates don't wipe the checklist out of the JSON.
+  const merged = await mergePreflightSteps(reportId, progress);
+  await prisma.report.update({ where: { id: reportId }, data: { reviewProgress: merged as any } });
+  publish(reportId, merged);
+}
+
+async function mergePreflightSteps(reportId: string, progress: ReviewProgress): Promise<ReviewProgress> {
+  if (progress.steps && progress.steps.length) return progress;
+  const cur = await prisma.report
+    .findUnique({ where: { id: reportId }, select: { reviewProgress: true } })
+    .catch(() => null);
+  const prevSteps = (cur?.reviewProgress as any)?.steps;
+  return prevSteps ? { ...progress, steps: prevSteps } : progress;
 }
 
 // While a long-running Claude call is in flight there are no natural progress
@@ -42,14 +56,20 @@ async function setProgress(reportId: string, progress: ReviewProgress) {
 // stale snapshot pulled from the DB at subscription time.
 function startProgressTicker(reportId: string, base: ReviewProgress, intervalMs = 4_000) {
   const start = Date.now();
+  let cachedSteps: ReviewProgress["steps"] | undefined = base.steps;
   const fire = async () => {
     const elapsed = Math.floor((Date.now() - start) / 1000);
+    if (!cachedSteps) {
+      const cur = await prisma.report
+        .findUnique({ where: { id: reportId }, select: { reviewProgress: true } })
+        .catch(() => null);
+      cachedSteps = (cur?.reviewProgress as any)?.steps;
+    }
     const evt: ReviewProgress = {
       ...base,
       message: `${base.message ?? "Reviewing"} (${elapsed}s elapsed)`,
+      steps: cachedSteps,
     };
-    // Persist on each tick so a brand-new SSE subscriber gets a recent snapshot
-    // from the DB, not a 2-minute-old one.
     await prisma.report
       .update({ where: { id: reportId }, data: { reviewProgress: evt as any } })
       .catch(() => {});
@@ -67,23 +87,105 @@ const MAX_REPORT_CHARS = 60_000; // ~15k tokens for 6k words; cap to keep prompt
 const MAX_SAMPLE_CHARS = 6_000;
 const MAX_TEMPLATE_CHARS = 8_000;
 
+// When the LLM marking call fails (timeouts, parse errors, rate limits) the
+// review otherwise looks like it succeeded — issues persisted, status flipped
+// to REVIEWED — but the marking card stays blank. Compute a deterministic
+// baseline from the current open issues so the reviewer always sees a score.
+async function fallbackMarkingFromIssues(reportId: string): Promise<any> {
+  const [issues, report] = await Promise.all([
+    prisma.issue.findMany({
+      where: { reportId, deleted: false },
+      select: { category: true, shortDescription: true, severity: true },
+    }),
+    prisma.report.findUnique({
+      where: { id: reportId },
+      select: { template: { select: { markingScheme: true } } },
+    }),
+  ]);
+  const scheme = (report?.template?.markingScheme as any) || null;
+  const W = scheme?.penalties || {
+    grammar: 0.25,
+    format: 5,
+    completeness: 5,
+    sectionUnder: 1,
+    sectionOver: 0.5,
+    other: 0.5,
+  };
+  const penalty = issues.reduce((acc, i) => {
+    const d = i.shortDescription.toLowerCase();
+    switch (i.category) {
+      case "GRAMMAR": return acc + W.grammar;
+      case "FORMAT": return acc + W.format;
+      case "COMPLETENESS": return acc + W.completeness;
+      case "SECTION_QUALITY":
+        if (d.startsWith("[over]") || d.includes("over-explain")) return acc + W.sectionOver;
+        return acc + W.sectionUnder;
+      default: return acc + W.other;
+    }
+  }, 0);
+  const baseline = scheme?.totalPoints ?? 85;
+  const overall = Math.max(0, Math.min(100, Math.round(baseline - penalty)));
+  // Derive per-section anchors from the scheme so the marking card shows
+  // which topics the rubric expects.
+  const perSection = scheme?.topics?.length
+    ? scheme.topics.map((t: any) => ({
+        title: t.heading,
+        score: Math.round(t.weight),
+        note: "scheme target weight",
+      }))
+    : [];
+  return {
+    overall,
+    perSection,
+    baselineOverall: overall,
+    baselinePenalty: penalty,
+    fallback: true,
+    schemeId: scheme?.generatedAt ?? null,
+  };
+}
+
+function isAbortError(e: any): boolean {
+  if (!e) return false;
+  if (e.name === "AbortError") return true;
+  const msg = String(e?.message || e);
+  return /aborted|cancelled/i.test(msg);
+}
+
 export async function reviewReport(reportId: string) {
+  const ctrl = registerAbort(reportId);
   try {
-    return await runReview(reportId);
+    return await runReview(reportId, ctrl.signal);
   } catch (e: any) {
     const msg = e?.message || String(e);
+    if (ctrl.signal.aborted || isAbortError(e)) {
+      await prisma.report.update({
+        where: { id: reportId },
+        data: {
+          status: "UPLOADED",
+          reviewProgress: { stage: "cancelled", message: "Review cancelled by user" } as any,
+        },
+      }).catch(() => {});
+      publish(reportId, { stage: "cancelled", message: "Review cancelled by user" });
+      return { cancelled: true };
+    }
     await prisma.report.update({
       where: { id: reportId },
       data: { status: "UPLOADED", reviewProgress: { stage: "failed", error: msg } as any },
     }).catch(() => {});
     publish(reportId, { stage: "failed", error: msg });
     throw e;
+  } finally {
+    clearAbort(reportId);
   }
 }
 
-async function runReview(reportId: string) {
+async function runReview(reportId: string, signal: AbortSignal) {
   const report = await prisma.report.findUnique({ where: { id: reportId } });
   if (!report) throw new Error("Report not found");
+
+  // Preflight steps were written by the review/route.ts before kicking us off.
+  // Capture them so we can re-attach them to every progress update we emit.
+  const preflightSteps = (report.reviewProgress as any)?.steps;
 
   // If the reviewer pinned a specific template for this report, use only that
   // one — otherwise fall back to the full template library.
@@ -134,9 +236,9 @@ async function runReview(reportId: string) {
     take: 200,
   });
 
-  // Clear prior LIVE AGENT issues so a re-run is idempotent. Soft-deleted
-  // rows (deleted=true) are intentionally preserved as the dismissal record.
-  await prisma.issue.deleteMany({ where: { reportId, source: "AGENT", deleted: false } });
+  // Note: we used to wipe prior AGENT issues here, but that left the report
+  // sidebar empty if the user refreshed mid-review. Now we keep them visible
+  // and replace atomically AFTER the new ones parse successfully (see below).
 
   // Already-flagged issues from the deterministic rule pass — pass them to the
   // LLM as context so it focuses on semantic findings instead of re-reporting
@@ -159,6 +261,9 @@ async function runReview(reportId: string) {
     : "(none)";
   const dismissedContext = `Previously dismissed issues (the reviewer explicitly deleted these on a prior pass — DO NOT re-report them or any near-duplicate. Even if the same span looks problematic, skip it):\n${dismissedBlob}`;
 
+  // Cross-report learnings — patterns the reviewer has rejected many times.
+  const learnedBlob = await buildLearnedRejectionBlob();
+
   await setProgress(reportId, {
     stage: "agent-running",
     ruleCount: ruleIssues.length,
@@ -176,9 +281,10 @@ async function runReview(reportId: string) {
       `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`,
       `Already-flagged issues from automated checks (DO NOT re-report these — focus on semantic problems they miss):\n${ruleBlob}`,
       dismissedContext,
+      learnedBlob,
       `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}`,
       `\nReturn JSON only matching the schema. No prose, no markdown fences.`,
-    ].join("\n\n");
+    ].filter(Boolean).join("\n\n");
     const reviewSystem = [
       REVIEW_SYSTEM_BASE,
       rubricFor(reviewMode),
@@ -197,12 +303,15 @@ async function runReview(reportId: string) {
         systemPrompt: reviewSystem,
         userPrompt: reviewUserPrompt,
         jsonSchema: reviewToolSchema.input_schema,
+        signal,
       });
     } catch (e: any) {
+      if (signal.aborted || isAbortError(e)) throw e;
       throw new Error(`claude CLI review failed: ${e.message}${e instanceof ClaudeCliError && e.stderr ? `\n${e.stderr.slice(0, 300)}` : ""}`);
     } finally {
       stopReviewTicker();
     }
+    if (signal.aborted) throw new Error("cancelled");
     const parsed = ReviewOutputSchema.parse(parsedCli);
     const dedupedCli = parsed.issues.filter(
       (iss) =>
@@ -230,7 +339,14 @@ async function runReview(reportId: string) {
         source: "AGENT" as const,
       };
     });
-    if (issueRecords.length) await prisma.issue.createMany({ data: issueRecords });
+    // Atomic swap: replace prior AGENT issues with this run's parse. Keeps the
+    // sidebar populated mid-run and avoids a flicker of "no issues" on refresh.
+    await prisma.$transaction([
+      prisma.issue.deleteMany({ where: { reportId, source: "AGENT", deleted: false } }),
+      ...(issueRecords.length
+        ? [prisma.issue.createMany({ data: issueRecords })]
+        : []),
+    ]);
 
     await setProgress(reportId, {
       stage: "marking-running",
@@ -266,38 +382,39 @@ async function runReview(reportId: string) {
       message: "Computing marks (Claude CLI)",
     });
     try {
-      const m = await runClaudeCliJson({
-        systemPrompt: markingSystem,
-        userPrompt: markingUserPrompt,
-        jsonSchema: markingToolSchema.input_schema,
-        timeoutMs: 180_000,
-      });
-      marking = MarkingOutputSchema.parse(m);
-    } catch (e: any) {
-      // Marking is non-critical; log + continue.
-      console.warn("claude CLI marking failed:", e.message);
+      for (let attempt = 1; attempt <= 2 && !marking; attempt++) {
+        try {
+          const m = await runClaudeCliJson({
+            systemPrompt: markingSystem,
+            userPrompt: markingUserPrompt,
+            jsonSchema: markingToolSchema.input_schema,
+            timeoutMs: 180_000,
+            signal,
+          });
+          marking = MarkingOutputSchema.parse(m);
+        } catch (e: any) {
+          if (signal.aborted || isAbortError(e)) throw e;
+          console.warn(`claude CLI marking attempt ${attempt} failed:`, e.message);
+        }
+      }
     } finally {
       stopMarkingTicker();
     }
-    await prisma.report.update({
-      where: { id: reportId },
-      data: {
-        status: "REVIEWED",
-        marking,
-        reviewProgress: {
-          stage: "reviewed",
-          ruleCount: ruleIssues.length,
-          agentCount: issueRecords.length,
-          startedAt: startedAt.toISOString(),
-        } as any,
-      },
-    });
-    publish(reportId, {
+    if (signal.aborted) throw new Error("cancelled");
+    if (!marking) marking = await fallbackMarkingFromIssues(reportId);
+    marking = await applyPassiveDeletionPenalty(reportId, marking);
+    const finalCli: ReviewProgress = {
       stage: "reviewed",
       ruleCount: ruleIssues.length,
       agentCount: issueRecords.length,
       startedAt: startedAt.toISOString(),
+      steps: preflightSteps,
+    };
+    await prisma.report.update({
+      where: { id: reportId },
+      data: { status: "REVIEWED", marking, reviewProgress: finalCli as any },
     });
+    publish(reportId, finalCli);
     return { issueCount: issueRecords.length, marking, via: "cli" };
   }
 
@@ -328,14 +445,16 @@ async function runReview(reportId: string) {
             { type: "text", text: `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`, cache_control: { type: "ephemeral" } },
             { type: "text", text: `Already-flagged issues from automated checks (DO NOT re-report — focus on semantic findings these miss):\n${ruleBlob}` },
             { type: "text", text: dismissedContext },
+            ...(learnedBlob ? [{ type: "text" as const, text: learnedBlob }] : []),
             { type: "text", text: `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}` },
           ],
         },
       ],
-    });
+    }, { signal });
   } finally {
     stopReviewTickerSdk();
   }
+  if (signal.aborted) throw new Error("cancelled");
 
   const reviewBlock = reviewMsg.content.find((b) => b.type === "tool_use");
   if (!reviewBlock || reviewBlock.type !== "tool_use") throw new Error("Claude did not call report_issues tool");
@@ -374,7 +493,11 @@ async function runReview(reportId: string) {
     };
   });
 
-  if (issueRecords.length) await prisma.issue.createMany({ data: issueRecords });
+  // Atomic swap (see CLI path note above).
+  await prisma.$transaction([
+    prisma.issue.deleteMany({ where: { reportId, source: "AGENT", deleted: false } }),
+    ...(issueRecords.length ? [prisma.issue.createMany({ data: issueRecords })] : []),
+  ]);
 
   await setProgress(reportId, {
     stage: "marking-running",
@@ -392,57 +515,58 @@ async function runReview(reportId: string) {
     startedAt: startedAt.toISOString(),
     message: "Computing marks (Claude SDK)",
   });
-  let markingMsg;
+  let marking: any = null;
   try {
-    markingMsg = await anthropic().messages.create({
-      model: MODEL,
-      max_tokens: 1500,
-      system: [
-        { type: "text", text: MARKING_SYSTEM_BASE, cache_control: { type: "ephemeral" } },
-        { type: "text", text: markingRubricFor(markingMode) },
-      ],
-      tools: [markingToolSchema as any],
-      tool_choice: { type: "tool", name: "submit_marking" },
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: `Templates:\n${templatesBlob || "(none)"}`, cache_control: { type: "ephemeral" } },
-            { type: "text", text: `Samples:\n${samplesBlob || "(none)"}`, cache_control: { type: "ephemeral" } },
-            { type: "text", text: `Student report:\n${reportText}` },
+    for (let attempt = 1; attempt <= 2 && !marking; attempt++) {
+      try {
+        const markingMsg = await anthropic().messages.create({
+          model: MODEL,
+          max_tokens: 1500,
+          system: [
+            { type: "text", text: MARKING_SYSTEM_BASE, cache_control: { type: "ephemeral" } },
+            { type: "text", text: markingRubricFor(markingMode) },
           ],
-        },
-      ],
-    });
+          tools: [markingToolSchema as any],
+          tool_choice: { type: "tool", name: "submit_marking" },
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: `Templates:\n${templatesBlob || "(none)"}`, cache_control: { type: "ephemeral" } },
+                { type: "text", text: `Samples:\n${samplesBlob || "(none)"}`, cache_control: { type: "ephemeral" } },
+                { type: "text", text: `Student report:\n${reportText}` },
+              ],
+            },
+          ],
+        }, { signal });
+        const markBlock = markingMsg.content.find((b) => b.type === "tool_use");
+        if (markBlock && markBlock.type === "tool_use") {
+          marking = MarkingOutputSchema.parse(markBlock.input);
+        }
+      } catch (e: any) {
+        if (signal.aborted || isAbortError(e)) throw e;
+        console.warn(`claude SDK marking attempt ${attempt} failed:`, e?.message || e);
+      }
+    }
   } finally {
     stopMarkingTickerSdk();
   }
+  if (signal.aborted) throw new Error("cancelled");
+  if (!marking) marking = await fallbackMarkingFromIssues(reportId);
+  marking = await applyPassiveDeletionPenalty(reportId, marking);
 
-  const markBlock = markingMsg.content.find((b) => b.type === "tool_use");
-  let marking = null as any;
-  if (markBlock && markBlock.type === "tool_use") {
-    marking = MarkingOutputSchema.parse(markBlock.input);
-  }
-
-  await prisma.report.update({
-    where: { id: reportId },
-    data: {
-      status: "REVIEWED",
-      marking,
-      reviewProgress: {
-        stage: "reviewed",
-        ruleCount: ruleIssues.length,
-        agentCount: issueRecords.length,
-        startedAt: startedAt.toISOString(),
-      } as any,
-    },
-  });
-  publish(reportId, {
+  const finalSdk: ReviewProgress = {
     stage: "reviewed",
     ruleCount: ruleIssues.length,
     agentCount: issueRecords.length,
     startedAt: startedAt.toISOString(),
+    steps: preflightSteps,
+  };
+  await prisma.report.update({
+    where: { id: reportId },
+    data: { status: "REVIEWED", marking, reviewProgress: finalSdk as any },
   });
+  publish(reportId, finalSdk);
 
   return { issueCount: issueRecords.length, marking, via: "sdk" as const };
 }

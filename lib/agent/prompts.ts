@@ -14,10 +14,11 @@ CRITICAL — what NOT to flag:
 
 Output rules (ENFORCED):
 - Use the report_issues tool. Do NOT output free text.
-- Each issue's shortDescription is a brief problem description (<=200 chars). NEVER include a suggested fix.
-- quotedText must be an exact substring copied from the report's plaintext.
+- shortDescription DEPICTS the problem only. NEVER suggest a fix, rewording, or solution. Quote the offending heading / paragraph / page / TOC bullet so the reviewer can locate it, then state the rule it violates. Max 200 chars.
+- quotedText must be an exact substring copied from the report's plaintext. Prefer the actual heading or first words of the offending paragraph so the reviewer can navigate to it.
 - DO NOT supply startOffset/endOffset. They are computed server-side from quotedText.
-- Categories: GRAMMAR (severe grammar/spelling errors), FORMAT (heading/section/structure mismatch vs template), COMPLETENESS (required section or required information missing), SECTION_QUALITY (a section exists but is shallow, off-topic, or incoherent), OTHER (factual error, plagiarism signal, etc.).
+- Categories: GRAMMAR (grammar/spelling/passive voice — agent-judged only, with sentence context), FORMAT (heading hierarchy, list style, citation format, section ordering vs template), COMPLETENESS (required section/required information missing, word count out of range), SECTION_QUALITY (a section exists but is under-explained, over-explained, off-topic, or incoherent), OTHER (factual error, plagiarism signal).
+- For SECTION_QUALITY, START shortDescription with the literal tag "[under]" if the section is under-explained relative to template guidance, or "[over]" if the section is over-explained / padded. The marking pipeline reads these tags.
 - Be thorough but precise. Do not invent flaws to hit a quota.
 `;
 
@@ -44,10 +45,25 @@ export function rubricFor(mode: Mode): string {
   ].join(" ");
 }
 
-export const MARKING_SYSTEM_BASE = `You are scoring a student report. Provide an overall numeric score (0-100) and per-section scores. Be calibrated to the marking mode given. Use submit_marking tool only.`;
+export const MARKING_SYSTEM_BASE = `You are scoring a student report (0-100 overall + per-section). Use submit_marking tool only.
+
+Score bands (anchor your overall here):
+- 80+ : Excellent. Best report-title content explanation, follows the template format throughout, minimum grammar/passive-voice errors, every topic properly explained with no under- or over-explained sections.
+- 60-79 : Average / good. Reasonable explanation and proper report formatting based on template, with some weaknesses.
+- 50-59 : Acceptable. Format must still be largely correct; explanations may be uneven.
+- <50  : Reserve for severe failures — wrong format, missing critical sections, or pervasive under/over-explanation.
+
+Deductions to bake into the overall (approximate, not strict math):
+- Wrong report formatting vs template: heavy (-5 per major format break).
+- Word count out of allowed min/max range on major content: heavy (-5).
+- A section being under-explained vs the template's guidance for that section: moderate (-1 each).
+- A section being over-explained / padded: light (-0.5 each).
+- Grammar / passive-voice errors: very light, ~ -0.5 per two mistakes.
+
+Per-section scores reflect that section's individual quality on the same 0-100 scale.`;
 
 export function markingRubricFor(mode: Mode): string {
-  if (mode === "STRICT") return `Marking mode: STRICT. 70+ = strong, 85+ = exceptional. Penalize every weakness.`;
-  if (mode === "MODERATE") return `Marking mode: MODERATE. 60-75 typical pass; 85+ excellent. Reward effort.`;
-  return `Marking mode: ACCEPTABLE. 65+ for any report meeting basic structure; reserve <50 for severe failures.`;
+  if (mode === "STRICT") return `Marking mode: STRICT. Apply the deductions in full; reserve 85+ for exceptional work.`;
+  if (mode === "MODERATE") return `Marking mode: MODERATE. Apply deductions but reward genuine effort; 85+ for excellent reports.`;
+  return `Marking mode: ACCEPTABLE. Apply deductions leniently; only severe failures land below 50.`;
 }

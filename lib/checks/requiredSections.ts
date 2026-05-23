@@ -48,24 +48,26 @@ export const requiredSectionsCheck: Check = ({ plainText, templates }) => {
   const reportHeadings = new Set(extractHeadings(plainText));
   const reportLower = plainText.toLowerCase();
 
-  const missing: string[] = [];
+  const snippet = plainText.slice(0, 80).trim() || "(start)";
+  const endOffset = Math.min(snippet.length, plainText.length);
+
+  // Emit one CRITICAL issue per missing section so the reviewer sees each
+  // template requirement as its own actionable row. The marking pipeline then
+  // applies the FORMAT/COMPLETENESS weight per item.
+  const issues: RuleIssue[] = [];
   for (const e of expected) {
     if (reportHeadings.has(e)) continue;
-    // Fallback: check if the title appears anywhere prominent.
     if (reportLower.includes(e)) continue;
-    missing.push(e);
-  }
-  if (!missing.length) return [];
-
-  const snippet = plainText.slice(0, 80).trim() || "(start)";
-  return [
-    {
+    // Title-case the heading for the description so the row reads cleanly.
+    const titled = e.replace(/\b\w/g, (c) => c.toUpperCase());
+    issues.push({
       startOffset: 0,
-      endOffset: Math.min(snippet.length, plainText.length),
+      endOffset,
       quotedText: snippet,
       severity: "CRITICAL",
-      category: "COMPLETENESS",
-      shortDescription: `Missing expected sections: ${missing.slice(0, 6).join(", ")}${missing.length > 6 ? "…" : ""}`,
-    },
-  ];
+      category: "FORMAT",
+      shortDescription: `Template requires a "${titled}" section — not found in the report.`,
+    });
+  }
+  return issues;
 };

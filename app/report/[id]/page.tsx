@@ -33,7 +33,8 @@ export default async function ReportPage({ params }: { params: Promise<{ id: str
         marking: (report.marking as any) || null,
         reviewStartedAt: report.reviewStartedAt ? report.reviewStartedAt.toISOString() : null,
         reviewProgress: (report.reviewProgress as any) || null,
-        wordCountLimit: report.wordCountLimit,
+        wordCountMin: report.wordCountMin,
+        wordCountMax: report.wordCountMax,
       }}
       skillCatalog={SKILLS.map((s) => ({ id: s.id, name: s.name, blurb: s.blurb }))}
       issues={report.issues.map((i) => ({

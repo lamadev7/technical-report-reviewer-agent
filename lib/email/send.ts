@@ -1,21 +1,30 @@
-import { Resend } from "resend";
+import nodemailer from "nodemailer";
 import { prisma } from "@/lib/db";
 import { screenshotIssue } from "@/lib/pdf/screenshot";
 
 const CONTEXT_RADIUS = 220;
 
+function getTransporter() {
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  if (!user) throw new Error("GMAIL_USER not set");
+  if (!pass) throw new Error("GMAIL_APP_PASSWORD not set (generate at https://myaccount.google.com/apppasswords)");
+  return nodemailer.createTransport({
+    service: "gmail",
+    auth: { user, pass },
+  });
+}
+
 export async function sendReportFeedback(reportId: string) {
   const report = await prisma.report.findUnique({
     where: { id: reportId },
-    include: { issues: { where: { deleted: false }, orderBy: { startOffset: "asc" } } },
+    include: { issues: { where: { deleted: false, severity: "CRITICAL" }, orderBy: { startOffset: "asc" } } },
   });
   if (!report) throw new Error("Report not found");
   if (!report.studentEmail) throw new Error("Report has no student email — cannot send");
-  if (!process.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY not set");
-  if (!process.env.RESEND_FROM_EMAIL) throw new Error("RESEND_FROM_EMAIL not set");
 
-  const resend = new Resend(process.env.RESEND_API_KEY);
-  const attachments: { filename: string; content: string; content_id?: string; contentType?: string }[] = [];
+  const transporter = getTransporter();
+  const attachments: { filename: string; content: Buffer; cid: string; contentType?: string }[] = [];
   const issueHtml: string[] = [];
 
   for (let i = 0; i < report.issues.length; i++) {
@@ -33,8 +42,8 @@ export async function sendReportFeedback(reportId: string) {
     const cid = `issue-${iss.id}@reviewer`;
     attachments.push({
       filename: `issue-${i + 1}.png`,
-      content: png.toString("base64"),
-      content_id: cid,
+      content: png,
+      cid,
       contentType: "image/png",
     });
     issueHtml.push(`
@@ -45,16 +54,37 @@ export async function sendReportFeedback(reportId: string) {
       </li>`);
   }
 
+  // Compute word count + range so we can flag over/under as a CRITICAL
+  // banner at the top of the email, independently of whether the rule pass
+  // already inserted a matching Issue row.
+  const wordCount = (report.plainText.match(/\b[\p{L}\p{N}']+\b/gu) || []).length;
+  const min = report.wordCountMin;
+  const max = report.wordCountMax;
+  let wcMsg: { tone: "ok" | "fail"; text: string };
+  if (min > 0 && wordCount < min) {
+    wcMsg = { tone: "fail", text: `CRITICAL — word count is ${wordCount.toLocaleString()}, below the required minimum of ${min.toLocaleString()}.` };
+  } else if (max > 0 && wordCount > max) {
+    wcMsg = { tone: "fail", text: `CRITICAL — word count is ${wordCount.toLocaleString()}, above the allowed maximum of ${max.toLocaleString()}.` };
+  } else {
+    wcMsg = { tone: "ok", text: `Word count ${wordCount.toLocaleString()} (within ${min || "—"}–${max || "—"})` };
+  }
+  const wcBanner = `<div style="margin: 8px 0 14px; padding: 8px 12px; border-radius: 4px; border: 1px solid ${wcMsg.tone === "fail" ? "#fca5a5" : "#a7f3d0"}; background: ${wcMsg.tone === "fail" ? "#fef2f2" : "#ecfdf5"}; color: ${wcMsg.tone === "fail" ? "#991b1b" : "#065f46"}; font-size: 13px;">${escapeHtml(wcMsg.text)}</div>`;
+
   const html = `
     <div style="font: 14px/1.6 -apple-system, system-ui, sans-serif; color: #111; max-width: 720px;">
       <p>Hi ${escapeHtml(report.studentName || "")},</p>
-      <p>Your report <em>${escapeHtml(report.filename)}</em> has been reviewed. Below are the issues to address:</p>
-      <ol>${issueHtml.join("")}</ol>
+      ${wcBanner}
+      ${
+        report.issues.length
+          ? `<p>Your report <em>${escapeHtml(report.filename)}</em> has been reviewed. Below are the <strong>critical</strong> issues to address:</p>
+             <ol>${issueHtml.join("")}</ol>`
+          : `<p>Your report <em>${escapeHtml(report.filename)}</em> has been reviewed and no critical issues were found in the content. Nice work.</p>`
+      }
       <p style="color: #666; font-size: 12px;">— Report Reviewer</p>
     </div>`;
 
-  await resend.emails.send({
-    from: process.env.RESEND_FROM_EMAIL!,
+  const info = await transporter.sendMail({
+    from: process.env.GMAIL_USER!,
     to: report.studentEmail,
     subject: `Report feedback: ${report.filename}`,
     html,
@@ -62,7 +92,7 @@ export async function sendReportFeedback(reportId: string) {
   });
 
   await prisma.report.update({ where: { id: reportId }, data: { status: "SENT" } });
-  return { sent: true, count: report.issues.length };
+  return { sent: true, count: report.issues.length, messageId: info.messageId };
 }
 
 function escapeHtml(s: string) {

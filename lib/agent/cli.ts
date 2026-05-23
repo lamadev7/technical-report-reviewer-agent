@@ -19,14 +19,20 @@ export function runClaudeCliJson<T = unknown>({
   jsonSchema,
   model = DEFAULT_MODEL,
   timeoutMs = 540_000,
+  signal,
 }: {
   systemPrompt: string;
   userPrompt: string;
   jsonSchema?: object;
   model?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<T> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new ClaudeCliError("claude CLI cancelled"));
+      return;
+    }
     const args = [
       "-p", userPrompt,
       "--system-prompt", systemPrompt,
@@ -52,19 +58,31 @@ export function runClaudeCliJson<T = unknown>({
     const proc = spawn("claude", args, { stdio: ["ignore", "pipe", "pipe"], cwd: "/tmp" });
     let out = "";
     let err = "";
+    let cancelled = false;
     const timer = setTimeout(() => {
       proc.kill("SIGKILL");
       reject(new ClaudeCliError(`claude CLI timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    const onAbort = () => {
+      cancelled = true;
+      proc.kill("SIGKILL");
+      clearTimeout(timer);
+      reject(new ClaudeCliError("claude CLI cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     proc.stdout.on("data", (d) => (out += d.toString()));
     proc.stderr.on("data", (d) => (err += d.toString()));
     proc.on("error", (e) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (cancelled) return;
       reject(new ClaudeCliError(`claude CLI spawn failed: ${e.message}`, err));
     });
     proc.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (cancelled) return;
       // claude CLI emits its JSON envelope on stderr when exit != 0; check both streams.
       const text = out.trim() || err.trim();
       let envelope: any = null;

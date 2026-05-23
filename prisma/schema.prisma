@@ -63,7 +63,8 @@ model Report {
   enabledSkills String[]     @default([])
   reviewStartedAt DateTime?
   reviewProgress  Json?
-  wordCountLimit  Int          @default(10000)
+  wordCountMin    Int          @default(10000)
+  wordCountMax    Int          @default(12000)
   issues        Issue[]
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
@@ -93,13 +94,35 @@ model Issue {
 }
 
 model KbTemplate {
-  id          String   @id @default(cuid())
-  name        String
-  filePath    String
-  htmlContent String
-  plainText   String
-  reports     Report[]
-  createdAt   DateTime @default(now())
+  id            String   @id @default(cuid())
+  name          String
+  filePath      String
+  htmlContent   String
+  plainText     String
+  // Auto-generated marking scheme derived from the template's headings and
+  // required word-count band. Computed once per template (and on demand when
+  // missing) and used as the deterministic baseline for the report marking.
+  markingScheme Json?
+  reports       Report[]
+  createdAt     DateTime @default(now())
+}
+
+// Cross-report dismissal learning. Each time a reviewer deletes an issue we
+// upsert a row keyed by a normalized form of the shortDescription. Once the
+// same pattern is dismissed >= LEARNED_REJECTION_THRESHOLD times across any
+// reports we treat it as a global "don't flag this kind of thing" hint and
+// inject it into the agent's system prompt on future reviews.
+model LearnedRejection {
+  id             String         @id @default(cuid())
+  normalizedDesc String         @unique
+  sampleDesc     String
+  sampleQuoted   String
+  category       IssueCategory
+  hitCount       Int            @default(1)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([hitCount])
 }
 
 model KbSample {

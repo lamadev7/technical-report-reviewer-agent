@@ -20,7 +20,8 @@ export type Issue = {
 };
 
 type ReviewProgress = {
-  stage: "starting" | "rules-done" | "agent-running" | "agent-done" | "marking-running" | "reviewed" | "failed";
+  stage: "starting" | "rules-done" | "agent-running" | "agent-done" | "marking-running" | "reviewed" | "failed" | "cancelled";
+  steps?: Array<{ name: string; status: "pending" | "pass" | "fail"; detail?: string }>;
   ruleCount?: number;
   agentCount?: number;
   startedAt?: string;
@@ -42,7 +43,8 @@ type Report = {
   marking: { overall: number; perSection: Array<{ title: string; score: number; note?: string }> } | null;
   reviewStartedAt: string | null;
   reviewProgress: ReviewProgress | null;
-  wordCountLimit: number;
+  wordCountMin: number;
+  wordCountMax: number;
 };
 
 type TemplateOpt = { id: string; name: string };
@@ -51,6 +53,11 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
   const router = useRouter();
   const [issues, setIssues] = useState<Issue[]>(initialIssues);
   const [marking, setMarking] = useState(report.marking);
+  // Sync state with fresh server props after router.refresh() so the marking
+  // card actually picks up newly-computed scores instead of staying stuck on
+  // the value read at mount time.
+  useEffect(() => { setIssues(initialIssues); }, [initialIssues]);
+  useEffect(() => { setMarking(report.marking); }, [report.marking]);
   const [recomputingMark, setRecomputingMark] = useState(false);
   const initialReviewing = report.status === "REVIEWING";
   const initialStart = report.reviewStartedAt ? new Date(report.reviewStartedAt).getTime() : null;
@@ -91,6 +98,11 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
           setReviewStart(null);
           setError(data.error || "Review failed");
           es.close();
+        } else if (data.stage === "cancelled") {
+          setReviewing(false);
+          setReviewStart(null);
+          es.close();
+          router.refresh();
         }
       } catch {}
     };
@@ -118,6 +130,10 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
           setReviewing(false);
           setReviewStart(null);
           setError(data.reviewProgress.error || "Review failed");
+        } else if (data.reviewProgress?.stage === "cancelled") {
+          setReviewing(false);
+          setReviewStart(null);
+          router.refresh();
         }
       } catch {}
     }, 5000);
@@ -147,8 +163,69 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
   const [searchHits, setSearchHits] = useState(0);
   const [searchActive, setSearchActive] = useState(0);
   const [reviewMode, setReviewMode] = useState(report.reviewMode);
-  const [wordCountLimit, setWordCountLimit] = useState<number>(report.wordCountLimit ?? 10000);
+  const [wordCountMin, setWordCountMin] = useState<number>(report.wordCountMin ?? 10000);
+  const [wordCountMax, setWordCountMax] = useState<number>(report.wordCountMax ?? 12000);
+  const [severityFilter, setSeverityFilter] = useState<"ALL" | "CRITICAL" | "MAJOR">("ALL");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [rightWidth, setRightWidth] = useState(360);
+  const [adding, setAdding] = useState<null | { quotedText: string; startOffset: number; endOffset: number }>(null);
+  const [schemeOpen, setSchemeOpen] = useState(false);
+  const [scheme, setScheme] = useState<any | null>(null);
+  const [schemeLoading, setSchemeLoading] = useState(false);
+  const [schemeError, setSchemeError] = useState<string | null>(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const w = Number(window.localStorage.getItem("rr.right.width"));
+    if (w >= 240 && w <= 800) setRightWidth(w);
+    setRightCollapsed(window.localStorage.getItem("rr.right.collapsed") === "1");
+  }, []);
+  const persistRightWidth = (w: number) => {
+    try { window.localStorage.setItem("rr.right.width", String(w)); } catch {}
+  };
+  const persistRightCollapsed = (v: boolean) => {
+    try { window.localStorage.setItem("rr.right.collapsed", v ? "1" : "0"); } catch {}
+  };
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null);
+  const onDragStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startW: rightWidth };
+    const onMove = (ev: MouseEvent) => {
+      if (!dragRef.current) return;
+      // The aside is on the RIGHT — dragging the handle leftwards widens it.
+      const delta = dragRef.current.startX - ev.clientX;
+      const next = Math.max(240, Math.min(800, dragRef.current.startW + delta));
+      setRightWidth(next);
+    };
+    const onUp = () => {
+      if (dragRef.current) persistRightWidth(rightWidthRef.current);
+      dragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const rightWidthRef = useRef(rightWidth);
+  useEffect(() => { rightWidthRef.current = rightWidth; }, [rightWidth]);
+  const wordCount = useMemo(
+    () => (report.plainText.match(/\b[\p{L}\p{N}']+\b/gu) || []).length,
+    [report.plainText],
+  );
+  const wordCountOutOfRange =
+    (wordCountMin > 0 && wordCount < wordCountMin) || (wordCountMax > 0 && wordCount > wordCountMax);
+  const filteredIssues = useMemo(
+    () => (severityFilter === "ALL" ? issues : issues.filter((i) => i.severity === severityFilter)),
+    [issues, severityFilter],
+  );
+  const visibleIds = useMemo(() => filteredIssues.map((i) => i.id), [filteredIssues]);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
   const [templateId, setTemplateId] = useState<string | "">(report.templateId || "");
+  const [studentEmail, setStudentEmail] = useState<string>(report.studentEmail ?? "");
+  const [emailSaving, setEmailSaving] = useState(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(studentEmail.trim());
   const [sending, setSending] = useState(false);
   const [approving, setApproving] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -302,95 +379,182 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
 
   return (
     <div className="flex flex-col h-screen">
-      <header className="border-b border-zinc-200 bg-white p-3 flex items-center gap-3">
-        <div className="flex flex-col">
-          <div className="text-sm font-semibold">{report.studentName || report.filename}</div>
-          <div className="text-xs text-zinc-500">
-            {report.filename}{report.studentEmail ? ` · ${report.studentEmail}` : ""} · status: {report.status}
-          </div>
-        </div>
-        <div className="flex-1 max-w-md ml-4 flex items-center gap-1">
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search in report…"
-            className="flex-1 rounded border border-zinc-300 px-2 py-1 text-sm"
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                if (!searchHits) return;
-                setSearchActive((i) => (e.shiftKey ? (i - 1 + searchHits) % searchHits : (i + 1) % searchHits));
-              }
-              if (e.key === "Escape") setSearch("");
-            }}
-          />
-          {debouncedSearch && (
-            <>
-              <span className="text-xs text-zinc-500 tabular-nums w-[70px] text-center">
-                {searchHits === 0 ? "0 hits" : `${searchActive + 1} / ${searchHits}`}
-              </span>
-              <button
-                disabled={!searchHits}
-                onClick={() => setSearchActive((i) => (i - 1 + searchHits) % searchHits)}
-                className="rounded border border-zinc-300 px-1.5 text-sm disabled:opacity-40"
-                title="Previous (Shift+Enter)"
-              >↑</button>
-              <button
-                disabled={!searchHits}
-                onClick={() => setSearchActive((i) => (i + 1) % searchHits)}
-                className="rounded border border-zinc-300 px-1.5 text-sm disabled:opacity-40"
-                title="Next (Enter)"
-              >↓</button>
-            </>
+      <header className="border-b border-zinc-200 bg-white p-3 flex flex-col gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="text-sm font-semibold truncate">{report.studentName || report.filename}</div>
+          {report.studentName && (
+            <div className="text-xs text-zinc-500 truncate min-w-0">{report.filename}</div>
           )}
+          <span className={`inline-flex items-center shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${statusBadgeClass(report.status)}`}>
+            {report.status}
+          </span>
         </div>
-        <select
-          className="rounded border border-zinc-300 px-2 py-1 text-sm max-w-[200px]"
-          value={templateId}
-          title="Pin a template — review will compare against this one only"
-          onChange={async (e) => {
-            const v = e.target.value;
-            setTemplateId(v);
-            await fetch(`/api/reports/${report.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ templateId: v || null }) });
-          }}
-        >
-          <option value="">All templates</option>
-          {templates.map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
-        <select
-          className="rounded border border-zinc-300 px-2 py-1 text-sm"
-          value={reviewMode}
-          onChange={async (e) => {
-            const m = e.target.value as Report["reviewMode"];
-            setReviewMode(m);
-            await fetch(`/api/reports/${report.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ reviewMode: m }) });
-          }}
-        >
-          <option value="STRICT">Strict</option>
-          <option value="MODERATE">Moderate</option>
-          <option value="ACCEPTABLE">Acceptable</option>
-        </select>
-        <label className="flex items-center gap-1 text-xs text-zinc-600" title="Minimum required word count — review aborts if the report is shorter than this">
+        <div className="flex items-end gap-3 flex-wrap">
+        <label className="flex-1 min-w-[200px] max-w-md flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500">
+          Search
+          <div className="flex items-center gap-1">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search in report…"
+              className="flex-1 rounded border border-zinc-300 px-2 py-1 text-sm normal-case tracking-normal text-zinc-900"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  if (!searchHits) return;
+                  setSearchActive((i) => (e.shiftKey ? (i - 1 + searchHits) % searchHits : (i + 1) % searchHits));
+                }
+                if (e.key === "Escape") setSearch("");
+              }}
+            />
+            {debouncedSearch && (
+              <>
+                <span className="text-xs text-zinc-500 tabular-nums w-[70px] text-center normal-case tracking-normal">
+                  {searchHits === 0 ? "0 hits" : `${searchActive + 1} / ${searchHits}`}
+                </span>
+                <button
+                  disabled={!searchHits}
+                  onClick={() => setSearchActive((i) => (i - 1 + searchHits) % searchHits)}
+                  className="rounded border border-zinc-300 px-1.5 py-1 text-sm disabled:opacity-40 normal-case tracking-normal"
+                  title="Previous (Shift+Enter)"
+                >↑</button>
+                <button
+                  disabled={!searchHits}
+                  onClick={() => setSearchActive((i) => (i + 1) % searchHits)}
+                  className="rounded border border-zinc-300 px-1.5 py-1 text-sm disabled:opacity-40 normal-case tracking-normal"
+                  title="Next (Enter)"
+                >↓</button>
+              </>
+            )}
+          </div>
+        </label>
+        <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500" title="Pin a template — review will compare against this one only">
+          Template
+          <select
+            className="rounded border border-zinc-300 px-2 py-1 text-sm max-w-[200px] normal-case tracking-normal text-zinc-900"
+            value={templateId}
+            onChange={async (e) => {
+              const v = e.target.value;
+              setTemplateId(v);
+              await fetch(`/api/reports/${report.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ templateId: v || null }) });
+            }}
+          >
+            <option value="">All templates</option>
+            {templates.map((t) => (
+              <option key={t.id} value={t.id}>{t.name}</option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500">
+          Mode
+          <select
+            className="rounded border border-zinc-300 px-2 py-1 text-sm normal-case tracking-normal text-zinc-900"
+            value={reviewMode}
+            onChange={async (e) => {
+              const m = e.target.value as Report["reviewMode"];
+              setReviewMode(m);
+              await fetch(`/api/reports/${report.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ reviewMode: m }) });
+            }}
+          >
+            <option value="STRICT">Strict</option>
+            <option value="MODERATE">Moderate</option>
+            <option value="ACCEPTABLE">Acceptable</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500" title="Minimum required word count — review aborts if shorter. 0 disables.">
           Min words
           <input
             type="number"
             min={0}
             step={500}
-            value={wordCountLimit}
-            onChange={(e) => setWordCountLimit(Number(e.target.value))}
+            value={wordCountMin}
+            onChange={(e) => setWordCountMin(Number(e.target.value))}
             onBlur={async () => {
               await fetch(`/api/reports/${report.id}`, {
                 method: "PATCH",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ wordCountLimit }),
+                body: JSON.stringify({ wordCountMin }),
               });
             }}
-            className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm tabular-nums"
+            className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm tabular-nums normal-case tracking-normal text-zinc-900"
           />
         </label>
-        <button
+        <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500" title="Maximum allowed word count — review aborts if longer. 0 disables.">
+          Max words
+          <input
+            type="number"
+            min={0}
+            step={500}
+            value={wordCountMax}
+            onChange={(e) => setWordCountMax(Number(e.target.value))}
+            onBlur={async () => {
+              await fetch(`/api/reports/${report.id}`, {
+                method: "PATCH",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ wordCountMax }),
+              });
+            }}
+            className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm tabular-nums normal-case tracking-normal text-zinc-900"
+          />
+        </label>
+        <div
+          className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500"
+          title={wordCountOutOfRange ? "Outside configured range — review will abort" : "Total words in the report"}
+        >
+          Words
+          <span
+            className={`inline-block w-20 rounded border px-2 py-1 text-sm tabular-nums text-center normal-case tracking-normal ${
+              wordCountOutOfRange ? "border-red-400 bg-red-50 text-red-700" : "border-zinc-300 text-zinc-900"
+            }`}
+          >
+            {wordCount.toLocaleString()}
+          </span>
+        </div>
+        <label
+          className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500"
+          title={report.studentEmail ? "Student email from report — edit if needed" : "Add a student email to enable sending feedback"}
+        >
+          <span className="flex items-center gap-1">
+            Email
+            {emailSaving && <span className="text-[10px] normal-case tracking-normal text-zinc-400">saving…</span>}
+            {emailError && <span className="text-[10px] normal-case tracking-normal text-red-600">{emailError}</span>}
+          </span>
+          <input
+            type="email"
+            value={studentEmail}
+            placeholder="student@example.com"
+            onChange={(e) => { setStudentEmail(e.target.value); if (emailError) setEmailError(null); }}
+            onBlur={async () => {
+              const trimmed = studentEmail.trim();
+              if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+                setEmailError("Invalid email");
+                return;
+              }
+              if (trimmed === (report.studentEmail ?? "")) return;
+              setEmailSaving(true);
+              try {
+                const res = await fetch(`/api/reports/${report.id}`, {
+                  method: "PATCH",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ studentEmail: trimmed }),
+                });
+                if (!res.ok) {
+                  const body = await res.json().catch(() => ({} as any));
+                  setEmailError(body.error || "Save failed");
+                } else {
+                  router.refresh();
+                }
+              } finally {
+                setEmailSaving(false);
+              }
+            }}
+            className={`w-56 rounded border px-2 py-1 text-sm normal-case tracking-normal text-zinc-900 ${emailError ? "border-red-400" : "border-zinc-300"}`}
+          />
+        </label>
+        <div className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500">
+          <span aria-hidden="true">&nbsp;</span>
+          <div className="flex items-center gap-1">
+          <button
           disabled={!canReview}
           onClick={async () => {
             const now = Date.now();
@@ -398,7 +562,7 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
             await fetch(`/api/reports/${report.id}`, {
               method: "PATCH",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ wordCountLimit }),
+              body: JSON.stringify({ wordCountMin, wordCountMax }),
             }).catch(() => {});
             setReviewing(true); setReviewStart(now); setElapsed(0); setError(null);
             setProgress({ stage: "starting", startedAt: new Date(now).toISOString() });
@@ -424,18 +588,41 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
               setProgress({ stage: "failed", error: e.message });
             }
           }}
-          className="rounded bg-zinc-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
+          className="rounded bg-zinc-900 px-3 py-1 text-sm text-white disabled:opacity-50 normal-case tracking-normal"
           title={templateCount === 0 ? "Upload at least one template first" : ""}
         >
           {reviewing ? `Reviewing… ${elapsed}s` : "Review"}
         </button>
+        {reviewing && (
+          <button
+            onClick={async () => {
+              if (!confirm("Cancel the in-flight review? Progress will be saved.")) return;
+              await fetch(`/api/reports/${report.id}/review/cancel`, { method: "POST" }).catch(() => {});
+              setReviewing(false);
+              setReviewStart(null);
+              setProgress({ stage: "cancelled", message: "Review cancelled by user" });
+            }}
+            className="grid h-7 w-7 place-items-center rounded border border-red-300 bg-white text-red-600 hover:bg-red-50"
+            title="Stop the in-flight review"
+            aria-label="Stop review"
+          >
+            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+              <rect x="2" y="2" width="12" height="12" rx="1.5" fill="currentColor" />
+            </svg>
+          </button>
+        )}
+        </div>
+        </div>
+        </div>
       </header>
 
-      {reviewing && <ReviewProgress elapsed={elapsed} issues={issues} progress={progress} />}
+      {(reviewing || (progress?.steps && progress.steps.length > 0)) && (
+        <ReviewProgress elapsed={elapsed} issues={issues} progress={progress} />
+      )}
       {error && <div className="bg-red-50 text-red-700 text-sm p-2">{error}</div>}
 
-      <div className="flex-1 grid grid-cols-[1fr_360px] min-h-0">
-        <div className="overflow-y-auto p-6 bg-zinc-100">
+      <div className="flex-1 flex min-h-0">
+        <div className="flex-1 min-w-0 overflow-y-auto p-6 bg-zinc-100">
           {isPdf ? (
             <PdfReportViewer
               fileUrl={`/api/reports/${report.id}/file`}
@@ -453,11 +640,73 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
           )}
         </div>
 
-        <aside className="border-l border-zinc-200 bg-white overflow-y-auto p-4 flex flex-col gap-3">
+        {!rightCollapsed && (
+          <div
+            onMouseDown={onDragStart}
+            className="group relative w-px cursor-col-resize bg-zinc-200 hover:bg-blue-400"
+            title="Drag to resize"
+          >
+            <div className="absolute inset-y-0 -left-1 -right-1" />
+          </div>
+        )}
+        <button
+          onClick={() => {
+            setRightCollapsed((c) => {
+              const next = !c;
+              persistRightCollapsed(next);
+              return next;
+            });
+          }}
+          className="self-start mt-3 -ml-3 z-10 grid h-6 w-6 place-items-center rounded-full border border-zinc-200 bg-white text-xs text-zinc-600 shadow hover:bg-zinc-50"
+          title={rightCollapsed ? "Show issues panel" : "Hide issues panel"}
+        >
+          {rightCollapsed ? "‹" : "›"}
+        </button>
+        <aside
+          style={{ width: rightCollapsed ? 0 : rightWidth }}
+          className={`${rightCollapsed ? "w-0 overflow-hidden" : ""} bg-white overflow-y-auto p-4 flex flex-col gap-3 shrink-0`}
+        >
           {marking && (
             <div className="rounded border border-amber-200 bg-amber-50 p-3">
               <div className="flex items-center gap-2 mb-1">
                 <div className="text-xs uppercase tracking-wide text-amber-700">Marking · reviewer-only</div>
+                <button
+                  onClick={async () => {
+                    setSchemeOpen(true);
+                    if (!report.templateId) {
+                      setSchemeError("Select a template first to see its marking scheme.");
+                      return;
+                    }
+                    if (scheme || schemeLoading) return;
+                    setSchemeLoading(true);
+                    setSchemeError(null);
+                    try {
+                      const res = await fetch(`/api/knowledge/templates/${report.templateId}/scheme`);
+                      const json = await res.json();
+                      if (!res.ok) throw new Error(json.error || "Failed to load scheme");
+                      if (!json.markingScheme) {
+                        // Trigger generation on demand.
+                        const gen = await fetch(`/api/knowledge/templates/${report.templateId}/scheme`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+                        const genJson = await gen.json();
+                        if (!gen.ok) throw new Error(genJson.error || "Failed to generate scheme");
+                        setScheme(genJson.markingScheme);
+                      } else {
+                        setScheme(json.markingScheme);
+                      }
+                    } catch (e: any) {
+                      setSchemeError(e.message);
+                    } finally {
+                      setSchemeLoading(false);
+                    }
+                  }}
+                  title="View auto-generated marking scheme for this template"
+                  className="text-amber-700 hover:text-amber-900"
+                  aria-label="View marking scheme"
+                >
+                  <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                    <path fill="currentColor" d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Zm0 11.5a5 5 0 1 1 0-10 5 5 0 0 1 0 10Zm-.75-8.25V8h1.5V4.75h-1.5Zm0 4.5V11h1.5v-1.5h-1.5Z"/>
+                  </svg>
+                </button>
                 <button
                   onClick={async () => {
                     if (recomputingMark) return;
@@ -492,9 +741,37 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
             </div>
           )}
 
+          {progress?.steps && progress.steps.length > 0 && (
+            <div className="rounded border border-blue-200 bg-blue-50 p-3">
+              <div className="text-xs uppercase tracking-wide text-blue-800 mb-1.5 font-medium">
+                Preflight checks
+              </div>
+              <ul className="flex flex-col gap-1 text-xs">
+                {progress.steps.map((s, i) => {
+                  const icon = s.status === "pass" ? "✓" : s.status === "fail" ? "✗" : "…";
+                  const tone =
+                    s.status === "pass" ? "text-emerald-700"
+                    : s.status === "fail" ? "text-red-700"
+                    : "text-zinc-500";
+                  return (
+                    <li key={i} className="flex flex-col gap-0.5">
+                      <div className="flex items-baseline gap-1.5">
+                        <span className={`font-mono ${tone}`}>{icon}</span>
+                        <span className="font-medium text-zinc-800">{s.name}</span>
+                      </div>
+                      {s.detail && (
+                        <span className="text-[11px] text-zinc-600 pl-4 leading-snug">{s.detail}</span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+
           <div className="flex items-center justify-between gap-2">
             <h2 className="font-semibold text-sm">
-              Issues ({issues.length})
+              Issues ({issues.length}{severityFilter !== "ALL" ? ` · ${filteredIssues.length} ${severityFilter.toLowerCase()}` : ""})
               {issues.length > 0 && (
                 <span className="ml-2 text-xs font-normal text-zinc-500">
                   {issues.filter((i) => i.source === "RULE").length} rule ·{" "}
@@ -512,26 +789,144 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
                 Show all
               </button>
             )}
-            <AddIssueButton
-              reportId={report.id}
-              getDocRoot={() => docRef.current}
-              plainText={report.plainText}
-              isPdf={isPdf}
-              onAdded={(iss, m) => {
-                setIssues((xs) => [...xs, iss].sort((a, b) => a.startOffset - b.startOffset));
-                if (m) setMarking(m);
+            <button
+              onClick={() => {
+                const sel = window.getSelection();
+                let quotedText = "";
+                let offset = 0;
+                if (sel && !sel.isCollapsed) {
+                  quotedText = sel.toString().trim();
+                  if (isPdf) {
+                    const norm = quotedText.replace(/\s+/g, " ");
+                    const idx = report.plainText.replace(/\s+/g, " ").indexOf(norm);
+                    offset = idx >= 0 ? idx : 0;
+                  } else {
+                    const root = docRef.current;
+                    const range = sel.getRangeAt(0);
+                    offset = computeOffset(root, range.startContainer, range.startOffset);
+                  }
+                }
+                setAdding({
+                  quotedText,
+                  startOffset: offset,
+                  endOffset: offset + quotedText.length,
+                });
               }}
-            />
+              className="text-xs rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50"
+              title="Add a new issue (select text in the report first to attach it to a span)"
+            >+ Add</button>
           </div>
 
+          {adding && (
+            <NewIssueCard
+              draft={adding}
+              onChangeDraft={setAdding}
+              onCancel={() => setAdding(null)}
+              onSave={async (payload) => {
+                const res = await fetch(`/api/reports/${report.id}/issues`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify(payload),
+                });
+                if (!res.ok) {
+                  const b = await res.json().catch(() => ({} as any));
+                  throw new Error(b.error || "Add failed");
+                }
+                const body = await res.json();
+                const { marking: m, ...iss } = body;
+                setIssues((xs) => [...xs, iss as Issue].sort((a, b) => a.startOffset - b.startOffset));
+                if (m) setMarking(m);
+                setAdding(null);
+              }}
+            />
+          )}
+
+          {issues.length > 0 && (
+            <div className="flex items-center flex-wrap gap-1.5 text-[11px]">
+              {(["ALL", "CRITICAL", "MAJOR"] as const).map((sev) => {
+                const count = sev === "ALL" ? issues.length : issues.filter((i) => i.severity === sev).length;
+                const active = severityFilter === sev;
+                const tone =
+                  sev === "CRITICAL" ? "bg-red-100 text-red-800 border-red-200"
+                  : sev === "MAJOR" ? "bg-orange-100 text-orange-800 border-orange-200"
+                  : "bg-zinc-100 text-zinc-700 border-zinc-200";
+                return (
+                  <button
+                    key={sev}
+                    onClick={() => setSeverityFilter(sev)}
+                    className={`rounded-full border px-2 py-0.5 ${active ? "ring-2 ring-blue-400 " : ""}${tone}`}
+                  >
+                    {sev === "ALL" ? "All" : sev.charAt(0) + sev.slice(1).toLowerCase()} · {count}
+                  </button>
+                );
+              })}
+              <label className="ml-2 inline-flex items-center gap-1 text-zinc-600">
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={(e) => {
+                    setSelectedIds((prev) => {
+                      const next = new Set(prev);
+                      if (e.target.checked) visibleIds.forEach((id) => next.add(id));
+                      else visibleIds.forEach((id) => next.delete(id));
+                      return next;
+                    });
+                  }}
+                />
+                Select all visible
+              </label>
+              {selectedIds.size > 0 && (
+                <button
+                  disabled={bulkBusy}
+                  onClick={async () => {
+                    const ids = Array.from(selectedIds);
+                    if (!confirm(`Delete ${ids.length} selected issue${ids.length === 1 ? "" : "s"}?`)) return;
+                    setBulkBusy(true);
+                    try {
+                      const res = await fetch(`/api/reports/${report.id}/issues`, {
+                        method: "DELETE",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ ids }),
+                      });
+                      if (res.ok) {
+                        const json = await res.json().catch(() => ({} as any));
+                        setIssues((xs) => xs.filter((x) => !selectedIds.has(x.id)));
+                        setSelectedIds(new Set());
+                        if (json.marking) setMarking(json.marking);
+                      }
+                    } finally {
+                      setBulkBusy(false);
+                    }
+                  }}
+                  className="ml-auto rounded bg-red-600 text-white px-2 py-0.5 disabled:opacity-50"
+                >
+                  {bulkBusy ? "Deleting…" : `Delete ${selectedIds.size}`}
+                </button>
+              )}
+            </div>
+          )}
+
           <ul className="flex flex-col gap-2">
-            {issues.length === 0 && <li className="text-xs text-zinc-400 italic">No issues yet. Click Review.</li>}
-            {issues.map((iss) => (
+            {filteredIssues.length === 0 && (
+              <li className="text-xs text-zinc-400 italic">
+                {issues.length === 0 ? "No issues yet. Click Review." : `No ${severityFilter.toLowerCase()} issues.`}
+              </li>
+            )}
+            {filteredIssues.map((iss) => (
               <IssueCard
                 key={iss.id}
                 issue={iss}
                 isHovered={hovered?.issue.id === iss.id}
                 isActive={activeIssueId === iss.id}
+                selected={selectedIds.has(iss.id)}
+                onToggleSelect={() =>
+                  setSelectedIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(iss.id)) next.delete(iss.id);
+                    else next.add(iss.id);
+                    return next;
+                  })
+                }
                 registerRef={(el) => {
                   if (el) cardRefs.current.set(iss.id, el);
                   else cardRefs.current.delete(iss.id);
@@ -552,6 +947,12 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
                 onDelete={async () => {
                   const res = await fetch(`/api/reports/${report.id}/issues/${iss.id}`, { method: "DELETE" });
                   setIssues((xs) => xs.filter((x) => x.id !== iss.id));
+                  setSelectedIds((prev) => {
+                    if (!prev.has(iss.id)) return prev;
+                    const next = new Set(prev);
+                    next.delete(iss.id);
+                    return next;
+                  });
                   if (res.ok) {
                     const json = await res.json().catch(() => ({} as any));
                     if (json.marking) setMarking(json.marking);
@@ -601,25 +1002,51 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
               >
                 {exporting ? "Exporting…" : "Export PDF"}
               </button>
-            </div>
-            {report.studentEmail && (
               <button
-                disabled={sending || report.status !== "APPROVED"}
+                disabled={
+                  sending ||
+                  !emailValid ||
+                  emailSaving ||
+                  (report.status !== "APPROVED" && report.status !== "SENT")
+                }
                 onClick={async () => {
+                  const trimmed = studentEmail.trim();
+                  if (!trimmed || !emailValid) {
+                    setEmailError("Enter a valid email first");
+                    return;
+                  }
                   setSending(true); setError(null);
                   try {
+                    // Persist any unsaved email edit before sending so the server reads the latest value.
+                    if (trimmed !== (report.studentEmail ?? "")) {
+                      const patch = await fetch(`/api/reports/${report.id}`, {
+                        method: "PATCH",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ studentEmail: trimmed }),
+                      });
+                      if (!patch.ok) {
+                        const body = await patch.json().catch(() => ({} as any));
+                        throw new Error(body.error || "Could not save email");
+                      }
+                    }
                     const res = await fetch(`/api/reports/${report.id}/send`, { method: "POST" });
-                    if (!res.ok) throw new Error((await res.json()).error || "Send failed");
+                    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Send failed");
                     router.refresh();
                   } catch (e: any) { setError(e.message); }
                   finally { setSending(false); }
                 }}
                 className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-50"
-                title={report.status !== "APPROVED" ? "Approve first" : `Send to ${report.studentEmail}`}
+                title={
+                  report.status !== "APPROVED" && report.status !== "SENT"
+                    ? "Approve first"
+                    : !emailValid
+                      ? "Add a valid email first"
+                      : `Send to ${studentEmail.trim()}`
+                }
               >
-                {sending ? "Sending…" : `Send feedback to ${report.studentEmail}`}
+                {sending ? "Sending…" : report.status === "SENT" ? "Re-send Email" : "Send Email"}
               </button>
-            )}
+            </div>
           </div>
         </aside>
       </div>
@@ -645,6 +1072,166 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
           />
         </div>
       )}
+      {schemeOpen && (
+        <SchemeModal
+          scheme={scheme}
+          loading={schemeLoading}
+          error={schemeError}
+          templateId={report.templateId}
+          reportPlainText={report.plainText}
+          onRegenerate={async () => {
+            if (!report.templateId) return;
+            setSchemeLoading(true);
+            setSchemeError(null);
+            try {
+              const res = await fetch(`/api/knowledge/templates/${report.templateId}/scheme`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+              const json = await res.json();
+              if (!res.ok) throw new Error(json.error || "Regenerate failed");
+              setScheme(json.markingScheme);
+            } catch (e: any) {
+              setSchemeError(e.message);
+            } finally {
+              setSchemeLoading(false);
+            }
+          }}
+          onClose={() => setSchemeOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function SchemeModal({ scheme, loading, error, templateId, reportPlainText, onRegenerate, onClose }: {
+  scheme: any | null;
+  loading: boolean;
+  error: string | null;
+  templateId: string | null;
+  reportPlainText: string;
+  onRegenerate: () => void;
+  onClose: () => void;
+}) {
+  // Lowercased report once so each topic-presence check is a cheap substring scan.
+  const reportLower = reportPlainText.toLowerCase();
+  const isPresent = (heading: string): boolean => {
+    const h = heading.toLowerCase().trim();
+    if (!h) return false;
+    // Whole-phrase match is most accurate, but PDF extraction often glues words
+    // together — fall back to a tokens-all-present match for short headings.
+    if (reportLower.includes(h)) return true;
+    const tokens = h.split(/\s+/).filter((t) => t.length > 2);
+    if (tokens.length >= 2 && tokens.every((t) => reportLower.includes(t))) return true;
+    return false;
+  };
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[85vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-zinc-200 px-5 py-3">
+          <h3 className="text-sm font-semibold">Marking scheme · auto-generated from template</h3>
+          <div className="flex items-center gap-2">
+            {templateId && (
+              <button
+                onClick={onRegenerate}
+                disabled={loading}
+                className="text-xs rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50 disabled:opacity-50"
+                title="Regenerate scheme from the latest template content"
+              >
+                {loading ? "…" : "Regenerate"}
+              </button>
+            )}
+            <button onClick={onClose} className="text-zinc-500 hover:text-zinc-800 text-xl leading-none px-1" aria-label="Close">×</button>
+          </div>
+        </div>
+        <div className="px-5 py-4 text-sm">
+          {error && <div className="rounded bg-red-50 text-red-700 p-2 text-xs mb-3">{error}</div>}
+          {!error && !scheme && loading && <div className="text-zinc-500 text-xs">Loading scheme…</div>}
+          {!error && !scheme && !loading && <div className="text-zinc-500 text-xs">No scheme available.</div>}
+          {scheme && (
+            <div className="flex flex-col gap-4">
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div className="rounded border border-zinc-200 p-2">
+                  <div className="uppercase text-zinc-500 mb-1 text-[10px] tracking-wide">Total</div>
+                  <div className="font-semibold text-lg">{scheme.totalPoints} pts</div>
+                </div>
+                <div className="rounded border border-zinc-200 p-2">
+                  <div className="uppercase text-zinc-500 mb-1 text-[10px] tracking-wide">Word count band</div>
+                  <div className="font-semibold">{scheme.wordCountBand.min.toLocaleString()} – {scheme.wordCountBand.max.toLocaleString()}</div>
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Topic weights</div>
+                <table className="w-full text-xs border-collapse">
+                  <thead>
+                    <tr className="text-left text-zinc-500 border-b border-zinc-200">
+                      <th className="py-1 font-medium w-6">#</th>
+                      <th className="py-1 font-medium w-8">In&nbsp;report</th>
+                      <th className="py-1 font-medium">Topic</th>
+                      <th className="py-1 font-medium text-right">Weight</th>
+                      <th className="py-1 font-medium text-right">Required</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scheme.topics.map((t: any, i: number) => {
+                      const present = isPresent(t.heading);
+                      return (
+                        <tr key={t.id} className="border-b border-zinc-100">
+                          <td className="py-1 text-zinc-500">{i + 1}</td>
+                          <td className="py-1" title={present ? "Heading found in the report" : "Not found in the report — check structure"}>
+                            {present ? (
+                              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 text-emerald-600" aria-label="present"><path fill="currentColor" d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm3.78 5.97a.75.75 0 0 0-1.06 0L7 9.69 5.28 7.97a.75.75 0 1 0-1.06 1.06l2.25 2.25c.3.3.77.3 1.06 0l4.25-4.25a.75.75 0 0 0 0-1.06Z"/></svg>
+                            ) : (
+                              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 text-red-600" aria-label="missing"><path fill="currentColor" d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm2.78 4.22a.75.75 0 0 0-1.06 0L8 5.94 6.28 4.22a.75.75 0 1 0-1.06 1.06L6.94 7 5.22 8.72a.75.75 0 1 0 1.06 1.06L8 8.06l1.72 1.72a.75.75 0 1 0 1.06-1.06L9.06 7l1.72-1.72a.75.75 0 0 0 0-1.06Z"/></svg>
+                            )}
+                          </td>
+                          <td className="py-1">{t.heading}</td>
+                          <td className="py-1 text-right tabular-nums">{t.weight} pts</td>
+                          <td className="py-1 text-right text-zinc-500">{t.required ? "yes" : "no"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Bucket budgets</div>
+                  <table className="w-full text-xs">
+                    <tbody>
+                      {Object.entries(scheme.buckets).map(([k, v]) => (
+                        <tr key={k} className="border-b border-zinc-100">
+                          <td className="py-1 capitalize text-zinc-700">{k.replace(/([A-Z])/g, " $1").trim()}</td>
+                          <td className="py-1 text-right tabular-nums">{String(v)} pts</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Per-issue penalties</div>
+                  <table className="w-full text-xs">
+                    <tbody>
+                      {Object.entries(scheme.penalties).map(([k, v]) => (
+                        <tr key={k} className="border-b border-zinc-100">
+                          <td className="py-1 capitalize text-zinc-700">{k.replace(/([A-Z])/g, " $1").trim()}</td>
+                          <td className="py-1 text-right tabular-nums">−{String(v)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="text-[10px] text-zinc-400">
+                Generated {new Date(scheme.generatedAt).toLocaleString()}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -662,32 +1249,45 @@ function ReviewProgress({ elapsed, issues, progress }: { elapsed: number; issues
   const pct = Math.round(band.start + (band.end - band.start) * within);
 
   return (
-    <div className="bg-blue-50 border-b border-blue-200 px-4 py-2 text-sm flex items-center gap-4">
-      <div className="flex-1">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="font-medium text-blue-900">{stage}</span>
-          <span className="text-xs text-blue-700">
-            {elapsed}s elapsed · {band.label}
-            {progress?.stage === "marking-running" || progress?.stage === "agent-running"
-              ? " — still working (Claude can take 60–180s per call)"
-              : ""}
+    <div className="bg-blue-50 border-b border-blue-200 px-4 py-2 text-sm flex flex-col gap-2">
+      <div className="flex items-center gap-4">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="font-medium text-blue-900">{stage}</span>
+            <span className="text-xs text-blue-700">
+              {elapsed}s elapsed · {band.label}
+              {progress?.stage === "marking-running" || progress?.stage === "agent-running"
+                ? " — still working (Claude can take 60–180s per call)"
+                : ""}
+            </span>
+          </div>
+          <div className="h-1.5 bg-blue-100 rounded overflow-hidden relative">
+            <div className="h-full bg-blue-500 transition-all" style={{ width: `${pct}%` }} />
+            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-blue-400/40 to-transparent animate-[pulse_2s_ease-in-out_infinite]" />
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-xs">
+          <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
+            ✓ Rules: {ruleCount}
+          </span>
+          <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800">
+            ⏳ AI: {agentCount}
           </span>
         </div>
-        <div className="h-1.5 bg-blue-100 rounded overflow-hidden relative">
-          <div className="h-full bg-blue-500 transition-all" style={{ width: `${pct}%` }} />
-          <div className="absolute inset-0 bg-gradient-to-r from-transparent via-blue-400/40 to-transparent animate-[pulse_2s_ease-in-out_infinite]" />
-        </div>
-      </div>
-      <div className="flex items-center gap-3 text-xs">
-        <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-          ✓ Rules: {ruleCount}
-        </span>
-        <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800">
-          ⏳ AI: {agentCount}
-        </span>
       </div>
     </div>
   );
+}
+
+function statusBadgeClass(status: Report["status"]): string {
+  switch (status) {
+    case "UPLOADED":  return "bg-zinc-100 text-zinc-700 border border-zinc-200";
+    case "REVIEWING": return "bg-blue-100 text-blue-800 border border-blue-200";
+    case "REVIEWED":  return "bg-amber-100 text-amber-800 border border-amber-200";
+    case "APPROVED":  return "bg-emerald-100 text-emerald-800 border border-emerald-200";
+    case "SENT":      return "bg-violet-100 text-violet-800 border border-violet-200";
+    default:          return "bg-zinc-100 text-zinc-700 border border-zinc-200";
+  }
 }
 
 function stageBand(stage: ReviewProgress["stage"] | undefined): { start: number; end: number; label: string } {
@@ -740,10 +1340,12 @@ function stageLabel(stage: ReviewProgress["stage"] | undefined, elapsed: number,
   }
 }
 
-function IssueCard({ issue, isHovered, isActive, registerRef, onScrollTo, onUpdate, onDelete }: {
+function IssueCard({ issue, isHovered, isActive, selected, onToggleSelect, registerRef, onScrollTo, onUpdate, onDelete }: {
   issue: Issue;
   isHovered: boolean;
   isActive: boolean;
+  selected: boolean;
+  onToggleSelect: () => void;
   registerRef: (el: HTMLLIElement | null) => void;
   onScrollTo: () => void;
   onUpdate: (p: Partial<Pick<Issue, "severity" | "category" | "shortDescription">>) => Promise<void>;
@@ -762,10 +1364,20 @@ function IssueCard({ issue, isHovered, isActive, registerRef, onScrollTo, onUpda
           ? "border-blue-500 bg-blue-50/60 ring-2 ring-blue-400 shadow"
           : isHovered
             ? "border-zinc-900"
-            : "border-zinc-200"
+            : selected
+              ? "border-blue-300 bg-blue-50/30"
+              : "border-zinc-200"
       }`}
     >
       <div className="flex items-center gap-1 mb-1">
+        <input
+          type="checkbox"
+          checked={selected}
+          onClick={(e) => e.stopPropagation()}
+          onChange={onToggleSelect}
+          className="mr-1"
+          title="Select for bulk delete"
+        />
         <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-medium ${issue.severity === "CRITICAL" ? "bg-red-100 text-red-800" : "bg-orange-100 text-orange-800"}`}>{issue.severity}</span>
         <span className="text-[10px] uppercase text-zinc-500">{issue.category}</span>
         <span className={`text-[10px] uppercase ml-auto px-1.5 py-0.5 rounded ${
@@ -809,42 +1421,89 @@ function IssueCard({ issue, isHovered, isActive, registerRef, onScrollTo, onUpda
   );
 }
 
-function AddIssueButton({ reportId, getDocRoot, plainText, isPdf, onAdded }: { reportId: string; getDocRoot: () => HTMLDivElement | null; plainText: string; isPdf: boolean; onAdded: (i: Issue, marking: any) => void }) {
+function NewIssueCard({ draft, onChangeDraft, onCancel, onSave }: {
+  draft: { quotedText: string; startOffset: number; endOffset: number };
+  onChangeDraft: (d: { quotedText: string; startOffset: number; endOffset: number }) => void;
+  onCancel: () => void;
+  onSave: (payload: { startOffset: number; endOffset: number; quotedText: string; severity: Severity; category: Category; shortDescription: string }) => Promise<void>;
+}) {
+  const [sev, setSev] = useState<Severity>("MAJOR");
+  const [cat, setCat] = useState<Category>("OTHER");
+  const [desc, setDesc] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   return (
-    <button
-      onClick={async () => {
-        const sel = window.getSelection();
-        if (!sel || sel.isCollapsed) { alert("Select some text in the document first."); return; }
-        const quotedText = sel.toString().trim();
-        if (!quotedText) return;
-        const desc = prompt("Comment description:", "");
-        if (!desc) return;
-        let offset = 0;
-        if (isPdf) {
-          // Locate selection inside the plainText (normalized) for offset hint
-          const norm = quotedText.replace(/\s+/g, " ");
-          const idx = plainText.replace(/\s+/g, " ").indexOf(norm);
-          offset = idx >= 0 ? idx : 0;
-        } else {
-          const root = getDocRoot();
-          const range = sel.getRangeAt(0);
-          offset = computeOffset(root, range.startContainer, range.startOffset);
-        }
-        const res = await fetch(`/api/reports/${reportId}/issues`, {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            startOffset: offset, endOffset: offset + quotedText.length,
-            quotedText, severity: "MAJOR", category: "OTHER", shortDescription: desc,
-          }),
-        });
-        if (res.ok) {
-          const body = await res.json();
-          const { marking: m, ...iss } = body;
-          onAdded(iss as Issue, m);
-        }
-      }}
-      className="text-xs rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50"
-    >+ Add</button>
+    <div className="rounded border border-blue-200 bg-blue-50 p-3 flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <div className="text-[11px] uppercase tracking-wide text-blue-800 font-medium">New issue</div>
+        <button onClick={onCancel} className="ml-auto text-zinc-500 hover:text-zinc-800 text-lg leading-none" aria-label="Cancel">×</button>
+      </div>
+      <label className="text-[10px] uppercase tracking-wide text-zinc-600">
+        Quoted text
+        <textarea
+          value={draft.quotedText}
+          onChange={(e) => onChangeDraft({ ...draft, quotedText: e.target.value, endOffset: draft.startOffset + e.target.value.length })}
+          rows={2}
+          placeholder="Paste or type a span from the report"
+          className="w-full mt-0.5 rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-900 normal-case tracking-normal"
+        />
+      </label>
+      <div className="flex gap-2">
+        <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-600">
+          Severity
+          <select value={sev} onChange={(e) => setSev(e.target.value as Severity)} className="rounded border-zinc-300 text-xs">
+            <option value="CRITICAL">Critical</option>
+            <option value="MAJOR">Major</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-600 flex-1">
+          Category
+          <select value={cat} onChange={(e) => setCat(e.target.value as Category)} className="rounded border-zinc-300 text-xs">
+            <option value="GRAMMAR">Grammar</option>
+            <option value="FORMAT">Format</option>
+            <option value="COMPLETENESS">Completeness</option>
+            <option value="SECTION_QUALITY">Section quality</option>
+            <option value="OTHER">Other</option>
+          </select>
+        </label>
+      </div>
+      <label className="text-[10px] uppercase tracking-wide text-zinc-600">
+        Description
+        <textarea
+          value={desc}
+          onChange={(e) => setDesc(e.target.value)}
+          rows={2}
+          placeholder="What's wrong here?"
+          className="w-full mt-0.5 rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-900 normal-case tracking-normal"
+          autoFocus
+        />
+      </label>
+      {err && <div className="text-[11px] text-red-700">{err}</div>}
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} disabled={busy} className="text-xs rounded px-2 py-1 text-zinc-600 hover:bg-zinc-100">Cancel</button>
+        <button
+          disabled={busy || !desc.trim() || !draft.quotedText.trim()}
+          onClick={async () => {
+            setBusy(true); setErr(null);
+            try {
+              await onSave({
+                startOffset: draft.startOffset,
+                endOffset: draft.endOffset,
+                quotedText: draft.quotedText.trim(),
+                severity: sev,
+                category: cat,
+                shortDescription: desc.trim(),
+              });
+            } catch (e: any) {
+              setErr(e.message || "Failed");
+            } finally {
+              setBusy(false);
+            }
+          }}
+          className="text-xs rounded bg-zinc-900 text-white px-2.5 py-1 disabled:opacity-50"
+        >{busy ? "Saving…" : "Add issue"}</button>
+      </div>
+    </div>
   );
 }
 

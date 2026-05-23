@@ -3,6 +3,12 @@
 // reconnect after a server restart fall back to the DB-stored snapshot on
 // `reviewProgress` so progress survives even if this map gets wiped.
 
+export type ReviewStep = {
+  name: string;
+  status: "pending" | "pass" | "fail";
+  detail?: string;
+};
+
 export type ReviewProgress = {
   stage:
     | "starting"
@@ -11,12 +17,14 @@ export type ReviewProgress = {
     | "agent-done"
     | "marking-running"
     | "reviewed"
-    | "failed";
+    | "failed"
+    | "cancelled";
   ruleCount?: number;
   agentCount?: number;
   startedAt?: string;
   message?: string;
   error?: string;
+  steps?: ReviewStep[];
 };
 
 type Subscriber = (evt: ReviewProgress) => void;
@@ -25,8 +33,39 @@ type Subscriber = (evt: ReviewProgress) => void;
 // reloads. Without this, the route handler and reviewer end up writing to
 // different Map instances after a hot-reload.
 const KEY = Symbol.for("@app/reviewBus");
-const g = globalThis as unknown as { [KEY]?: Map<string, Set<Subscriber>> };
+const ABORT_KEY = Symbol.for("@app/reviewAborts");
+const g = globalThis as unknown as {
+  [KEY]?: Map<string, Set<Subscriber>>;
+  [ABORT_KEY]?: Map<string, AbortController>;
+};
 const subscribers: Map<string, Set<Subscriber>> = g[KEY] || (g[KEY] = new Map());
+const aborts: Map<string, AbortController> = g[ABORT_KEY] || (g[ABORT_KEY] = new Map());
+
+export function registerAbort(reportId: string): AbortController {
+  // Replace any stale controller for the same report (defensive — should not
+  // happen because runReview is one-at-a-time per report).
+  aborts.get(reportId)?.abort();
+  const ctrl = new AbortController();
+  aborts.set(reportId, ctrl);
+  return ctrl;
+}
+
+export function getAbortSignal(reportId: string): AbortSignal | undefined {
+  return aborts.get(reportId)?.signal;
+}
+
+export function clearAbort(reportId: string): void {
+  aborts.delete(reportId);
+}
+
+// Returns true if a controller existed and was aborted, false otherwise.
+export function triggerAbort(reportId: string): boolean {
+  const ctrl = aborts.get(reportId);
+  if (!ctrl) return false;
+  ctrl.abort();
+  aborts.delete(reportId);
+  return true;
+}
 
 export function publish(reportId: string, evt: ReviewProgress): void {
   const set = subscribers.get(reportId);
@@ -50,5 +89,5 @@ export function subscribe(reportId: string, cb: Subscriber): () => void {
 }
 
 export function isTerminal(stage: ReviewProgress["stage"]): boolean {
-  return stage === "reviewed" || stage === "failed";
+  return stage === "reviewed" || stage === "failed" || stage === "cancelled";
 }

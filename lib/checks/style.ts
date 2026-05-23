@@ -1,7 +1,7 @@
 import type { Check, RuleIssue } from "./types";
 
 // write-good is CJS — load lazily so we don't fail on import-time side effects.
-let writeGood: ((s: string) => Array<{ index: number; offset: number; reason: string }>) | null = null;
+let writeGood: ((s: string, opts?: any) => Array<{ index: number; offset: number; reason: string }>) | null = null;
 
 async function getWriteGood() {
   if (!writeGood) {
@@ -13,9 +13,22 @@ async function getWriteGood() {
 
 const MAX_ISSUES = 25;
 
+// write-good's wordy/weasel/cliche/adverb rules generate too many false
+// positives on academic reports. Keep only high-signal rules; passive voice is
+// now handled by the agent's context-aware `passive-voice` skill instead of
+// write-good's naive pattern match.
+const WG_OPTS = {
+  weasel: false,
+  passive: false,
+  adverb: false,
+  tooWordy: false,
+  cliches: false,
+  eprime: false,
+};
+
 export const styleCheck: Check = async ({ plainText }) => {
   const wg = await getWriteGood();
-  const suggestions = wg(plainText) || [];
+  const suggestions = wg(plainText, WG_OPTS) || [];
   const issues: RuleIssue[] = [];
   // Group by reason so we don't drown the user in identical findings.
   const perReason = new Map<string, number>();

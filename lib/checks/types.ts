@@ -13,6 +13,8 @@ export type CheckContext = {
   plainText: string;
   filename: string;
   templates: Array<{ name: string; plainText: string }>;
+  wordCountMin: number;
+  wordCountMax: number;
 };
 
 export type Check = (ctx: CheckContext) => RuleIssue[] | Promise<RuleIssue[]>;

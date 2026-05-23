@@ -21,7 +21,7 @@ export default async function Sidebar() {
   }));
 
   return (
-    <aside className="w-64 shrink-0 border-r border-zinc-200 bg-white p-4 flex flex-col gap-2">
+    <aside className="w-64 border-r border-zinc-200 bg-white p-4 flex flex-col gap-2 h-full">
       <Link href="/" className="font-semibold text-lg mb-4">Report Reviewer</Link>
       <nav className="flex flex-col gap-1 text-sm">
         <Link href="/" className="rounded px-2 py-1.5 hover:bg-zinc-100">Home — Upload</Link>

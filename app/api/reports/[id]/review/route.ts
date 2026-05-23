@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { after } from "next/server";
 import { prisma } from "@/lib/db";
 import { reviewReport } from "@/lib/agent/reviewer";
-import { publish } from "@/lib/agent/reviewBus";
+import { publish, type ReviewStep } from "@/lib/agent/reviewBus";
+import { runAllChecks } from "@/lib/checks";
 
 export const runtime = "nodejs";
 export const maxDuration = 600;
@@ -16,45 +17,103 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
 
   const report = await prisma.report.findUnique({
     where: { id },
-    select: { status: true, plainText: true, wordCountLimit: true },
+    select: {
+      status: true,
+      plainText: true,
+      filename: true,
+      wordCountMin: true,
+      wordCountMax: true,
+      templateId: true,
+    },
   });
   if (!report) return NextResponse.json({ error: "Not found" }, { status: 404 });
   if (report.status === "REVIEWING") {
     return NextResponse.json({ status: "REVIEWING", already: true }, { status: 202 });
   }
 
-  // STEP 0 — word-count gate. Run before any Claude work so a too-short
-  // report fails fast and doesn't burn tokens / CLI time.
-  const words = countWords(report.plainText);
-  const limit = report.wordCountLimit;
-  if (limit > 0 && words < limit) {
-    const msg = `Report has ${words} words — below required minimum of ${limit}. Increase length or lower the threshold and retry.`;
-    // Don't clobber a previously-completed REVIEWED status — just record the
-    // failed-attempt progress so SSE listeners and reloads see why.
-    await prisma.report.update({
-      where: { id },
-      data: { reviewProgress: { stage: "failed", error: msg } as any },
-    });
-    publish(id, { stage: "failed", error: msg });
-    return NextResponse.json({ error: msg, words, limit }, { status: 400 });
-  }
-
-  // Flip status + emit "starting" before returning so any client that opens
-  // the SSE stream a tick later immediately sees the in-flight state.
   const startedAt = new Date();
+  const steps: ReviewStep[] = [];
+
+  // STEP 1 — total word count valid.
+  const words = countWords(report.plainText);
+  const min = report.wordCountMin;
+  const max = report.wordCountMax;
+  let rangeMsg: string | null = null;
+  if (min > 0 && words < min) rangeMsg = `${words} words — below required minimum of ${min}`;
+  else if (max > 0 && words > max) rangeMsg = `${words} words — above allowed maximum of ${max}`;
+  steps.push({
+    name: "Total word count valid",
+    status: rangeMsg ? "fail" : "pass",
+    detail: rangeMsg || `${words} words (range ${min || "—"} … ${max || "—"})`,
+  });
+
+  // STEP 2..N — rule pass (required sections, section depth, word-count rule
+  // issue). Each check produces zero or more RuleIssue rows; we map them into
+  // visible steps in the UI so the reviewer sees what passed and what failed.
+  const templates = await prisma.kbTemplate.findMany({
+    where: report.templateId ? { id: report.templateId } : {},
+    select: { name: true, plainText: true },
+  });
+  const ruleIssues = await runAllChecks({
+    plainText: report.plainText,
+    filename: report.filename,
+    templates,
+    wordCountMin: report.wordCountMin,
+    wordCountMax: report.wordCountMax,
+  });
+  const missingSectionIssues = ruleIssues.filter(
+    (i) => i.category === "FORMAT" && /Template requires/i.test(i.shortDescription),
+  );
+  const shallowSectionIssues = ruleIssues.filter(
+    (i) => i.category === "SECTION_QUALITY" && /shallow|heading-only|only \d+ words/i.test(i.shortDescription),
+  );
+  steps.push({
+    name: "All template-required sections present",
+    status: missingSectionIssues.length === 0 ? "pass" : "fail",
+    detail:
+      missingSectionIssues.length === 0
+        ? "Every heading the template requires was found in the report"
+        : `${missingSectionIssues.length} required section(s) missing: ` +
+          missingSectionIssues
+            .slice(0, 5)
+            .map((i) => i.shortDescription.match(/"([^"]+)"/)?.[1] || i.shortDescription)
+            .join(", ") +
+          (missingSectionIssues.length > 5 ? "…" : ""),
+  });
+  steps.push({
+    name: "Section depth sufficient",
+    status: shallowSectionIssues.length === 0 ? "pass" : "fail",
+    detail:
+      shallowSectionIssues.length === 0
+        ? "No heading-only / one-line sections detected"
+        : `${shallowSectionIssues.length} section(s) flagged as shallow`,
+  });
+
+  // Replace prior RULE issues with this run's set so re-runs don't pile up duplicates.
+  await prisma.$transaction([
+    prisma.issue.deleteMany({ where: { reportId: id, source: "RULE", deleted: false } }),
+    ...(ruleIssues.length
+      ? [
+          prisma.issue.createMany({
+            data: ruleIssues.map((i) => ({ ...i, reportId: id, source: "RULE" as const })),
+          }),
+        ]
+      : []),
+  ]);
+
+  // Flip status + emit "starting" with steps so the UI shows the checklist
+  // immediately.
   await prisma.report.update({
     where: { id },
     data: {
       status: "REVIEWING",
       reviewStartedAt: startedAt,
-      reviewProgress: { stage: "starting", startedAt: startedAt.toISOString() } as any,
+      reviewProgress: { stage: "starting", startedAt: startedAt.toISOString(), steps } as any,
     },
   });
-  publish(id, { stage: "starting", startedAt: startedAt.toISOString() });
+  publish(id, { stage: "starting", startedAt: startedAt.toISOString(), steps });
 
-  // Run the actual review after the response is sent. `after()` keeps the
-  // server invocation alive long enough for the work to complete; on Node
-  // self-hosting (the deployment target here) this runs to completion.
+  // Run the actual agent review after the response is sent.
   after(async () => {
     try {
       await reviewReport(id);
@@ -63,5 +122,5 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
     }
   });
 
-  return NextResponse.json({ status: "REVIEWING", startedAt: startedAt.toISOString() }, { status: 202 });
+  return NextResponse.json({ status: "REVIEWING", startedAt: startedAt.toISOString(), steps }, { status: 202 });
 }
