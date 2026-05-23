@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db";
 import { reviewReport } from "@/lib/agent/reviewer";
 import { publish, type ReviewStep } from "@/lib/agent/reviewBus";
 import { runAllChecks } from "@/lib/checks";
+import { normalizeDescription, LEARNED_REJECTION_THRESHOLD } from "@/lib/agent/learning";
 
 export const runtime = "nodejs";
 export const maxDuration = 600;
@@ -54,13 +55,41 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
     where: report.templateId ? { id: report.templateId } : {},
     select: { name: true, plainText: true },
   });
-  const ruleIssues = await runAllChecks({
+  const ruleIssuesRaw = await runAllChecks({
     plainText: report.plainText,
     filename: report.filename,
     templates,
     wordCountMin: report.wordCountMin,
     wordCountMax: report.wordCountMax,
   });
+
+  // Respect prior dismissals so deleted criticals don't resurface on every
+  // recheck. Drop candidates that match per-report soft-deletes or a
+  // globally-learned rejection pattern.
+  const [reportDismissed, globalLearned] = await Promise.all([
+    prisma.issue.findMany({
+      where: { reportId: id, deleted: true },
+      select: { shortDescription: true, quotedText: true },
+    }),
+    prisma.learnedRejection.findMany({
+      where: { hitCount: { gte: LEARNED_REJECTION_THRESHOLD } },
+      select: { normalizedDesc: true },
+    }),
+  ]);
+  const dismissedKeys = new Set<string>([
+    ...reportDismissed.map((i) => normalizeDescription(i.shortDescription)),
+    ...globalLearned.map((r) => r.normalizedDesc),
+  ]);
+  const dismissedPairs = new Set<string>(
+    reportDismissed.map((i) => `${i.shortDescription}::${i.quotedText}`),
+  );
+  const ruleIssues = ruleIssuesRaw.filter((i) => {
+    const key = normalizeDescription(i.shortDescription);
+    if (key && dismissedKeys.has(key)) return false;
+    if (dismissedPairs.has(`${i.shortDescription}::${i.quotedText}`)) return false;
+    return true;
+  });
+
   const missingSectionIssues = ruleIssues.filter(
     (i) => i.category === "FORMAT" && /Template requires/i.test(i.shortDescription),
   );

@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import dynamic from "next/dynamic";
+import { countMajorWords } from "@/lib/checks/majorContent";
 
 const PdfReportViewer = dynamic(() => import("./PdfReportViewer"), { ssr: false, loading: () => <div className="p-8 text-zinc-500 text-sm">Loading PDF viewer…</div> });
 
@@ -209,10 +210,8 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
   };
   const rightWidthRef = useRef(rightWidth);
   useEffect(() => { rightWidthRef.current = rightWidth; }, [rightWidth]);
-  const wordCount = useMemo(
-    () => (report.plainText.match(/\b[\p{L}\p{N}']+\b/gu) || []).length,
-    [report.plainText],
-  );
+  const wordCount = useMemo(() => countMajorWords(report.plainText), [report.plainText]);
+  const [recheckBusy, setRecheckBusy] = useState(false);
   const wordCountOutOfRange =
     (wordCountMin > 0 && wordCount < wordCountMin) || (wordCountMax > 0 && wordCount > wordCountMax);
   const filteredIssues = useMemo(
@@ -499,9 +498,37 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
         </label>
         <div
           className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-zinc-500"
-          title={wordCountOutOfRange ? "Outside configured range — review will abort" : "Total words in the report"}
+          title={wordCountOutOfRange ? "Outside configured range" : "Major-content word count (Intro → before Conclusion, bullets excluded)"}
         >
-          Words
+          <span className="flex items-center gap-1">
+            Words
+            <button
+              onClick={async () => {
+                if (recheckBusy) return;
+                setRecheckBusy(true);
+                try {
+                  const res = await fetch(`/api/reports/${report.id}/checks/recheck`, { method: "POST" });
+                  if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || "Recheck failed");
+                  const body = await res.json();
+                  if (Array.isArray(body.issues)) setIssues(body.issues);
+                  if (body.marking) setMarking(body.marking);
+                  router.refresh();
+                } catch (e: any) {
+                  setError(e.message);
+                } finally {
+                  setRecheckBusy(false);
+                }
+              }}
+              title="Re-run word-count + structure checks against current min/max"
+              disabled={recheckBusy}
+              className="text-zinc-500 hover:text-zinc-800 disabled:opacity-40"
+              aria-label="Refresh word-count checks"
+            >
+              <svg viewBox="0 0 16 16" width="11" height="11" className={recheckBusy ? "animate-spin" : ""} aria-hidden="true">
+                <path fill="currentColor" d="M8 3V1L4 4l4 3V5a3 3 0 1 1-3 3H3a5 5 0 1 0 5-5Z"/>
+              </svg>
+            </button>
+          </span>
           <span
             className={`inline-block w-20 rounded border px-2 py-1 text-sm tabular-nums text-center normal-case tracking-normal ${
               wordCountOutOfRange ? "border-red-400 bg-red-50 text-red-700" : "border-zinc-300 text-zinc-900"

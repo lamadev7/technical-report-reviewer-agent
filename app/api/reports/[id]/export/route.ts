@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { exportReviewPdf } from "@/lib/pdf/exportReview";
+import { countMajorWords } from "@/lib/checks/majorContent";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -13,7 +14,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
   });
   if (!report) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const wordCount = (report.plainText.match(/\b[\p{L}\p{N}']+\b/gu) || []).length;
+  const wordCount = countMajorWords(report.plainText);
 
   const pdf = await exportReviewPdf({
     filename: report.filename,

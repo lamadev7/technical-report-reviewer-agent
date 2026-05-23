@@ -1,6 +1,7 @@
 import nodemailer from "nodemailer";
 import { prisma } from "@/lib/db";
 import { screenshotIssue } from "@/lib/pdf/screenshot";
+import { countMajorWords } from "@/lib/checks/majorContent";
 
 const CONTEXT_RADIUS = 220;
 
@@ -54,10 +55,10 @@ export async function sendReportFeedback(reportId: string) {
       </li>`);
   }
 
-  // Compute word count + range so we can flag over/under as a CRITICAL
-  // banner at the top of the email, independently of whether the rule pass
-  // already inserted a matching Issue row.
-  const wordCount = (report.plainText.match(/\b[\p{L}\p{N}']+\b/gu) || []).length;
+  // Compute major-content word count (same logic the rule pass uses) so the
+  // banner matches the rule findings and the UI badge — counting the FULL
+  // plaintext made the email disagree with the rest of the system.
+  const wordCount = countMajorWords(report.plainText);
   const min = report.wordCountMin;
   const max = report.wordCountMax;
   let wcMsg: { tone: "ok" | "fail"; text: string };
