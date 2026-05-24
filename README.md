@@ -1,6 +1,7 @@
 # Report Reviewer Agent
 
 AI-assisted student report reviewer. Reviewer uploads templates + good/bad samples, drops in student reports, Claude flags **critical** and **major** issues with hover popovers on the formatted document, reviewer edits/approves comments, then emails feedback (with screenshots) to the student.
+<img width="1512" height="824" alt="Screenshot 2026-05-24 at 11 28 58" src="https://github.com/user-attachments/assets/3c0fa5f7-dc77-420d-b9b7-18f896f840e9" />
 
 ## Stack
 
