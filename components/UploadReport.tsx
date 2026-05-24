@@ -34,20 +34,26 @@ export default function UploadReport() {
       </div>
       <FileDrop
         disabled={busy}
-        accept=".pdf,.doc,.docx"
-        label={busy ? "Uploading…" : "Drag & drop or click to choose a report (.pdf, .doc, .docx)"}
+        accept=".pdf"
+        label={busy ? "Uploading…" : "Drag & drop or click to choose a report (.pdf only)"}
         onFiles={async (files) => {
           setError(null);
+          const file = files[0];
+          if (!file.name.toLowerCase().endsWith(".pdf")) {
+            setError("Only .pdf files are supported (preserves formatting).");
+            return;
+          }
           setBusy(true);
           try {
             const fd = new FormData();
-            fd.append("file", files[0]);
+            fd.append("file", file);
             fd.append("reviewMode", reviewMode);
             fd.append("markingMode", markingMode);
             const res = await fetch("/api/reports", { method: "POST", body: fd });
             if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Upload failed (${res.status})`);
             const { id } = await res.json();
             router.push(`/report/${id}`);
+            router.refresh();
           } catch (e: any) {
             setError(e.message || "Upload failed");
           } finally {

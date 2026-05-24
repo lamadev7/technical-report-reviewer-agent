@@ -7,7 +7,7 @@ import { runAllChecks } from "@/lib/checks";
 
 export const runtime = "nodejs";
 
-const ALLOWED = new Set([".pdf", ".doc", ".docx"]);
+const ALLOWED = new Set([".pdf"]);
 
 export async function POST(req: NextRequest) {
   const form = await req.formData();

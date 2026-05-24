@@ -171,6 +171,8 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
   const [bulkBusy, setBulkBusy] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
   const [rightWidth, setRightWidth] = useState(360);
+  const [markingCollapsed, setMarkingCollapsed] = useState(false);
+  const [preflightCollapsed, setPreflightCollapsed] = useState(false);
   const [adding, setAdding] = useState<null | { quotedText: string; startOffset: number; endOffset: number }>(null);
   const [schemeOpen, setSchemeOpen] = useState(false);
   const [scheme, setScheme] = useState<any | null>(null);
@@ -181,6 +183,8 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
     const w = Number(window.localStorage.getItem("rr.right.width"));
     if (w >= 240 && w <= 800) setRightWidth(w);
     setRightCollapsed(window.localStorage.getItem("rr.right.collapsed") === "1");
+    setMarkingCollapsed(window.localStorage.getItem("rr.marking.collapsed") === "1");
+    setPreflightCollapsed(window.localStorage.getItem("rr.preflight.collapsed") === "1");
   }, []);
   const persistRightWidth = (w: number) => {
     try { window.localStorage.setItem("rr.right.width", String(w)); } catch {}
@@ -695,8 +699,25 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
         >
           {marking && (
             <div className="rounded border border-amber-200 bg-amber-50 p-3">
-              <div className="flex items-center gap-2 mb-1">
+              <div className={`flex items-center gap-2 ${markingCollapsed ? "" : "mb-1"}`}>
+                <button
+                  onClick={() => {
+                    setMarkingCollapsed((c) => {
+                      const next = !c;
+                      try { window.localStorage.setItem("rr.marking.collapsed", next ? "1" : "0"); } catch {}
+                      return next;
+                    });
+                  }}
+                  className="text-amber-700 hover:text-amber-900"
+                  aria-label={markingCollapsed ? "Expand marking" : "Collapse marking"}
+                  title={markingCollapsed ? "Expand" : "Collapse"}
+                >
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" className={`transition-transform ${markingCollapsed ? "-rotate-90" : ""}`}>
+                    <path fill="currentColor" d="M3 5h10L8 11z"/>
+                  </svg>
+                </button>
                 <div className="text-xs uppercase tracking-wide text-amber-700">Marking · reviewer-only</div>
+                {!markingCollapsed && <>
                 <button
                   onClick={async () => {
                     setSchemeOpen(true);
@@ -758,41 +779,66 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
                 >
                   <RefreshIcon spinning={recomputingMark} />
                 </button>
+                </>}
               </div>
-              <div className="text-2xl font-semibold">{marking.overall}/100</div>
-              <ul className="mt-2 text-xs space-y-0.5">
-                {marking.perSection?.map((s, i) => (
-                  <li key={i} className="flex justify-between"><span className="truncate">{s.title}</span><span className="font-mono">{s.score}</span></li>
-                ))}
-              </ul>
+              {!markingCollapsed && (
+                <>
+                  <div className="text-2xl font-semibold">{marking.overall}/100</div>
+                  <ul className="mt-2 text-xs space-y-0.5">
+                    {marking.perSection?.map((s, i) => (
+                      <li key={i} className="flex justify-between"><span className="truncate">{s.title}</span><span className="font-mono">{s.score}</span></li>
+                    ))}
+                  </ul>
+                </>
+              )}
             </div>
           )}
 
           {progress?.steps && progress.steps.length > 0 && (
             <div className="rounded border border-blue-200 bg-blue-50 p-3">
-              <div className="text-xs uppercase tracking-wide text-blue-800 mb-1.5 font-medium">
-                Preflight checks
+              <div className={`flex items-center gap-2 ${preflightCollapsed ? "" : "mb-1.5"}`}>
+                <button
+                  onClick={() => {
+                    setPreflightCollapsed((c) => {
+                      const next = !c;
+                      try { window.localStorage.setItem("rr.preflight.collapsed", next ? "1" : "0"); } catch {}
+                      return next;
+                    });
+                  }}
+                  className="text-blue-800 hover:text-blue-900"
+                  aria-label={preflightCollapsed ? "Expand preflight" : "Collapse preflight"}
+                  title={preflightCollapsed ? "Expand" : "Collapse"}
+                >
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" className={`transition-transform ${preflightCollapsed ? "-rotate-90" : ""}`}>
+                    <path fill="currentColor" d="M3 5h10L8 11z"/>
+                  </svg>
+                </button>
+                <div className="text-xs uppercase tracking-wide text-blue-800 font-medium">
+                  Preflight checks
+                </div>
               </div>
-              <ul className="flex flex-col gap-1 text-xs">
-                {progress.steps.map((s, i) => {
-                  const icon = s.status === "pass" ? "✓" : s.status === "fail" ? "✗" : "…";
-                  const tone =
-                    s.status === "pass" ? "text-emerald-700"
-                    : s.status === "fail" ? "text-red-700"
-                    : "text-zinc-500";
-                  return (
-                    <li key={i} className="flex flex-col gap-0.5">
-                      <div className="flex items-baseline gap-1.5">
-                        <span className={`font-mono ${tone}`}>{icon}</span>
-                        <span className="font-medium text-zinc-800">{s.name}</span>
-                      </div>
-                      {s.detail && (
-                        <span className="text-[11px] text-zinc-600 pl-4 leading-snug">{s.detail}</span>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
+              {!preflightCollapsed && (
+                <ul className="flex flex-col gap-1 text-xs">
+                  {progress.steps.map((s, i) => {
+                    const icon = s.status === "pass" ? "✓" : s.status === "fail" ? "✗" : "…";
+                    const tone =
+                      s.status === "pass" ? "text-emerald-700"
+                      : s.status === "fail" ? "text-red-700"
+                      : "text-zinc-500";
+                    return (
+                      <li key={i} className="flex flex-col gap-0.5">
+                        <div className="flex items-baseline gap-1.5">
+                          <span className={`font-mono ${tone}`}>{icon}</span>
+                          <span className="font-medium text-zinc-800">{s.name}</span>
+                        </div>
+                        {s.detail && (
+                          <span className="text-[11px] text-zinc-600 pl-4 leading-snug">{s.detail}</span>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
           )}
 

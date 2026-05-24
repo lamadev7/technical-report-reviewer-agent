@@ -9,7 +9,7 @@ type Props = {
   disabled?: boolean;
 };
 
-export default function FileDrop({ accept = ".pdf,.doc,.docx", onFiles, label = "Drag & drop or click to choose file", multiple = false, disabled = false }: Props) {
+export default function FileDrop({ accept = ".pdf", onFiles, label = "Drag & drop or click to choose file", multiple = false, disabled = false }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [drag, setDrag] = useState(false);
 
