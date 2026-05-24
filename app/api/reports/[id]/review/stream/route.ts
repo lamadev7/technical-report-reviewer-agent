@@ -42,12 +42,26 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         controller.close();
         return;
       }
-      const snapshot: ReviewProgress =
-        (r.reviewProgress as ReviewProgress | null) ??
-        (r.status === "REVIEWED" ? { stage: "reviewed" } : { stage: "starting" });
+      const stored = r.reviewProgress as ReviewProgress | null;
+      const statusTerminal =
+        r.status === "REVIEWED" || r.status === "APPROVED" || r.status === "SENT";
+      // If the stored progress is a terminal stage (failed/cancelled/reviewed)
+      // from a prior run but the report's current status is NOT terminal
+      // (UPLOADED/REVIEWING), treat it as stale. Otherwise a fresh client that
+      // just clicked Review races the POST-side DB update and gets served the
+      // old terminal snapshot — which makes its SSE handler immediately flip
+      // `reviewing` back to false and hide the progress bar.
+      let snapshot: ReviewProgress;
+      if (statusTerminal) {
+        snapshot = stored ?? { stage: "reviewed" };
+      } else if (stored && !isTerminal(stored.stage)) {
+        snapshot = stored;
+      } else {
+        snapshot = { stage: "starting" };
+      }
       send(snapshot);
 
-      if (r.status === "REVIEWED" || r.status === "APPROVED" || r.status === "SENT") {
+      if (statusTerminal) {
         controller.close();
         return;
       }

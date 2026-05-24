@@ -853,16 +853,17 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
                 </span>
               )}
             </h2>
-            {activeIssueId && (
+            <div className="flex items-center gap-1.5">
+              {activeIssueId && (
+                <button
+                  onClick={() => setActiveIssueId(null)}
+                  className="text-xs rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50"
+                  title="Esc — clear selection, show all highlights"
+                >
+                  Show all
+                </button>
+              )}
               <button
-                onClick={() => setActiveIssueId(null)}
-                className="text-xs rounded border border-zinc-300 px-2 py-0.5 hover:bg-zinc-50"
-                title="Esc — clear selection, show all highlights"
-              >
-                Show all
-              </button>
-            )}
-            <button
               onClick={() => {
                 const sel = window.getSelection();
                 let quotedText = "";
@@ -888,6 +889,7 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
               className="text-xs rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50"
               title="Add a new issue (select text in the report first to attach it to a span)"
             >+ Add</button>
+            </div>
           </div>
 
           {adding && (

@@ -3,7 +3,6 @@ import { prisma } from "@/lib/db";
 import { save } from "@/lib/storage";
 import { ingestBuffer } from "@/lib/ingest/toHtml";
 import { extractHeader } from "@/lib/ingest/extractHeader";
-import { runAllChecks } from "@/lib/checks";
 
 export const runtime = "nodejs";
 
@@ -51,25 +50,8 @@ export async function POST(req: NextRequest) {
     select: { id: true },
   });
 
-  // Run cheap deterministic checks now so the user sees findings immediately
-  // and the LLM review can skip the easy stuff later.
-  try {
-    const templates = await prisma.kbTemplate.findMany({ select: { name: true, plainText: true } });
-    const ruleIssues = await runAllChecks({
-      plainText: ingested.plainText,
-      filename: file.name,
-      templates,
-      wordCountMin: 0,
-      wordCountMax: 0,
-    });
-    if (ruleIssues.length) {
-      await prisma.issue.createMany({
-        data: ruleIssues.map((i) => ({ ...i, reportId: report.id, source: "RULE" as const })),
-      });
-    }
-  } catch (e: any) {
-    console.warn("rule-check pass failed:", e?.message || e);
-  }
+  // Rule pass deferred until /review so the issue list stays empty until the
+  // reviewer explicitly kicks off a review.
 
   return NextResponse.json({ id: report.id });
 }

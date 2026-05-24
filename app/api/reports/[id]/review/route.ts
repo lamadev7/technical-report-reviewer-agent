@@ -5,13 +5,10 @@ import { reviewReport } from "@/lib/agent/reviewer";
 import { publish, type ReviewStep } from "@/lib/agent/reviewBus";
 import { runAllChecks } from "@/lib/checks";
 import { normalizeDescription, LEARNED_REJECTION_THRESHOLD } from "@/lib/agent/learning";
+import { countMajorWords } from "@/lib/checks/majorContent";
 
 export const runtime = "nodejs";
 export const maxDuration = 600;
-
-function countWords(s: string): number {
-  return (s.match(/\b[\p{L}\p{N}']+\b/gu) || []).length;
-}
 
 export async function POST(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -35,8 +32,8 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
   const startedAt = new Date();
   const steps: ReviewStep[] = [];
 
-  // STEP 1 — total word count valid.
-  const words = countWords(report.plainText);
+  // STEP 1 — major-content word count valid (matches the header badge).
+  const words = countMajorWords(report.plainText);
   const min = report.wordCountMin;
   const max = report.wordCountMax;
   let rangeMsg: string | null = null;

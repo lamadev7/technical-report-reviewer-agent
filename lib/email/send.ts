@@ -10,9 +10,18 @@ function getTransporter() {
   const pass = process.env.GMAIL_APP_PASSWORD;
   if (!user) throw new Error("GMAIL_USER not set");
   if (!pass) throw new Error("GMAIL_APP_PASSWORD not set (generate at https://myaccount.google.com/apppasswords)");
+  // Explicit host/port instead of `service: "gmail"` (which defaults to
+  // smtp.gmail.com:465 SSL). Many networks/ISPs block 465; 587 with STARTTLS
+  // is more reliable and is Gmail's recommended submission port.
   return nodemailer.createTransport({
-    service: "gmail",
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false,
+    requireTLS: true,
     auth: { user, pass },
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 30_000,
   });
 }
 
@@ -84,13 +93,29 @@ export async function sendReportFeedback(reportId: string) {
       <p style="color: #666; font-size: 12px;">— Report Reviewer</p>
     </div>`;
 
-  const info = await transporter.sendMail({
-    from: process.env.GMAIL_USER!,
-    to: report.studentEmail,
-    subject: `Report feedback: ${report.filename}`,
-    html,
-    attachments,
-  });
+  let info;
+  try {
+    info = await transporter.sendMail({
+      from: process.env.GMAIL_USER!,
+      to: report.studentEmail,
+      subject: `Report feedback: ${report.filename}`,
+      html,
+      attachments,
+    });
+  } catch (e: any) {
+    const code = e?.code || "";
+    if (code === "ETIMEDOUT" || code === "ESOCKET" || code === "ECONNECTION") {
+      throw new Error(
+        `SMTP connection failed (${code}). Gmail's submission port may be blocked on this network — try a different network/VPN, or open outbound TCP 587 to smtp.gmail.com.`,
+      );
+    }
+    if (code === "EAUTH") {
+      throw new Error(
+        "Gmail rejected the credentials. Make sure GMAIL_APP_PASSWORD is a 16-character App Password (not your Google account password) and 2FA is enabled on the account.",
+      );
+    }
+    throw new Error(`Email send failed: ${e?.message || e}`);
+  }
 
   await prisma.report.update({ where: { id: reportId }, data: { status: "SENT" } });
   return { sent: true, count: report.issues.length, messageId: info.messageId };
