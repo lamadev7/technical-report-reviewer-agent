@@ -63,7 +63,7 @@ model Report {
   enabledSkills String[]     @default([])
   reviewStartedAt DateTime?
   reviewProgress  Json?
-  wordCountMin    Int          @default(10000)
+  wordCountMin    Int          @default(8000)
   wordCountMax    Int          @default(12000)
   issues        Issue[]
   createdAt     DateTime     @default(now())

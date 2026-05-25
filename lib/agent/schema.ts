@@ -8,12 +8,16 @@ export const IssueSchema = z.object({
   // 60k-char blob. Reviewer snaps offsets server-side from quotedText.
   startOffset: z.number().int().nonnegative().optional(),
   endOffset: z.number().int().nonnegative().optional(),
-  quotedText: z.string().min(1).max(500),
+  // Coerce overruns instead of failing the whole batch — some providers
+  // (notably Gemini) ignore the cap and return whole paragraphs as the quote.
+  // Truncating still leaves a unique prefix indexOf can match against the
+  // report text for offset snapping.
+  quotedText: z.preprocess(
+    (v) => (typeof v === "string" && v.length > 500 ? v.slice(0, 497) + "..." : v),
+    z.string().min(1).max(500),
+  ),
   severity: Severity,
   category: Category,
-  // Coerce overruns instead of failing the whole batch — the model occasionally
-  // ignores the 200-char cap, and dropping every overrun would discard valid
-  // findings.
   shortDescription: z.preprocess(
     (v) => (typeof v === "string" && v.length > 200 ? v.slice(0, 197) + "..." : v),
     z.string().min(1).max(200),
@@ -29,15 +33,29 @@ export type IssueOut = z.infer<typeof IssueSchema>;
 
 export const MarkingOutputSchema = z.object({
   overall: z.number().min(0).max(100),
+  // Some models (notably Claude on terse marking prompts) occasionally omit
+  // perSection entirely. Treat missing/null as an empty list so a valid
+  // overall score isn't thrown away — downstream UI already handles [] via
+  // optional chaining and the recompute pass adds per-section weights when
+  // a template scheme is attached.
   perSection: z
-    .array(
-      z.object({
-        title: z.string().min(1).max(120),
-        score: z.number().min(0).max(100),
-        note: z.string().max(300).optional(),
-      }),
+    .preprocess(
+      (v) => (v === undefined || v === null ? [] : v),
+      z.array(
+        z.object({
+          title: z.preprocess(
+            (v) => (typeof v === "string" && v.length > 120 ? v.slice(0, 117) + "..." : v),
+            z.string().min(1).max(120),
+          ),
+          score: z.number().min(0).max(100),
+          note: z.preprocess(
+            (v) => (typeof v === "string" && v.length > 300 ? v.slice(0, 297) + "..." : v),
+            z.string().max(300).optional(),
+          ),
+        }),
+      ).max(20),
     )
-    .max(20),
+    .default([]),
 });
 export type MarkingOutput = z.infer<typeof MarkingOutputSchema>;
 
@@ -53,10 +71,10 @@ export const reviewToolSchema = {
         items: {
           type: "object",
           properties: {
-            quotedText: { type: "string", description: "Exact substring from the report containing the issue (<=300 chars). Offsets are computed server-side." },
+            quotedText: { type: "string", maxLength: 500, description: "Exact substring from the report containing the issue (<=300 chars preferred, hard cap 500). Offsets are computed server-side." },
             severity: { type: "string", enum: ["CRITICAL", "MAJOR"] },
             category: { type: "string", enum: ["GRAMMAR", "FORMAT", "COMPLETENESS", "SECTION_QUALITY", "OTHER"] },
-            shortDescription: { type: "string", description: "<=200 char problem description, no fix" },
+            shortDescription: { type: "string", maxLength: 200, description: "<=200 char problem description, no fix" },
           },
           required: ["quotedText", "severity", "category", "shortDescription"],
         },
@@ -75,17 +93,18 @@ export const markingToolSchema = {
       overall: { type: "number", minimum: 0, maximum: 100 },
       perSection: {
         type: "array",
+        maxItems: 20,
         items: {
           type: "object",
           properties: {
-            title: { type: "string" },
+            title: { type: "string", maxLength: 120 },
             score: { type: "number", minimum: 0, maximum: 100 },
-            note: { type: "string" },
+            note: { type: "string", maxLength: 300 },
           },
           required: ["title", "score"],
         },
       },
     },
-    required: ["overall", "perSection"],
+    required: ["overall"],
   },
 };

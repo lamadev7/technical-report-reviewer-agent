@@ -13,9 +13,60 @@ export type SkillDef = {
   instructions: string;
   // Default-on for new reports.
   defaultOn: boolean;
+  // Force-include on every review regardless of the report's enabledSkills.
+  // Use for structural rules that must never be disabled (e.g. flexible
+  // heading matching — applies to every report).
+  alwaysOn?: boolean;
 };
 
 export const SKILLS: SkillDef[] = [
+  {
+    id: "flexible-section-matching",
+    name: "Flexible section matching",
+    blurb: "Match template sections to report sections by role, not exact title or numbering",
+    defaultOn: true,
+    alwaysOn: true,
+    instructions: [
+      "Skill: FLEXIBLE SECTION MATCHING (overrides naive heading comparison — read carefully).",
+      "",
+      "Goal: decide whether each TEMPLATE section is present in the REPORT by ROLE, not by exact heading text or numbering. A section counts as PRESENT if any one of these is true in the report:",
+      "  (a) An exact heading match (case-insensitive, ignoring punctuation, numbering prefixes, and trailing 's').",
+      "  (b) A near-synonym heading that serves the same role (see equivalence table below).",
+      "  (c) A page or block that fulfils the role even without a heading — typically the first page (cover page), an image / scanned block (declaration sheet), or a clearly labelled list (references).",
+      "  (d) VISUAL evidence on pages 1–4 when the report PDF is attached. Many declaration sheets, signature blocks, and cover pages are SCANNED IMAGES; text extraction from those pages is empty or garbled. If the PDF is attached, you MUST inspect the rendered pages 1–4 visually before claiming Cover Page / Declaration / Title Page is missing. A visible logo + title block, or a visible signed declaration, counts as PRESENT — even if no extracted text proves it.",
+      "Only flag a section as MISSING when none of (a), (b), (c), or (d) is satisfied.",
+      "",
+      "Equivalence table — treat these as the SAME section (do not require the exact template wording):",
+      "  - Cover Page  ≡  Front Page  ≡  Title Page  ≡  (any first-page block with university/college name or logo + report title + student name + ID + date, with or without a 'Cover Page' heading). If the report's first page carries that signal — even as text-only metadata or a logo placeholder line ('University of …', 'Bachelor of …', 'Submitted by …'), or if the attached PDF's page 1 shows a visible logo + title + author block as an image — Cover Page is PRESENT. DO NOT flag missing 'Cover Page' just because the literal heading is absent.",
+      "  - Title and Declaration Sheet  ≡  Declaration  ≡  Declaration Sheet  ≡  Student Declaration  ≡  Statement of Originality  ≡  Authorship Declaration  ≡  any block (heading, paragraph, or image caption) containing the keyword 'declaration', 'declare', or 'I hereby declare'. Image-only declarations count as PRESENT (text extraction may show just a stub caption like 'Declaration' or 'Signed:'). Do not require the full template wording. CRITICAL: declaration sheets are commonly inserted as a scanned/photographed page somewhere between page 1 and page 4 of the PDF. When the PDF is attached, look at the visible images on those pages: a page with a paragraph of 'I hereby declare …' text rendered as part of an image, with a signature box or stamp, IS a declaration sheet — DO NOT flag missing-declaration in that case. Past noisy false-positives: flagging missing Declaration when a signed scan was clearly visible on page 2.",
+      "  - References and Bibliography  ≡  References  ≡  Bibliography  ≡  Works Cited  ≡  List of References  ≡  any combination of those headings. PRESENT if EITHER 'References' OR 'Bibliography' (or any equivalent) appears. Bibliography is OPTIONAL — never flag missing-Bibliography on its own. If both appear in either order, that is also PRESENT, not a duplicate.",
+      "  - Abstract  ≡  Executive Summary  ≡  Summary.",
+      "  - Acknowledgements  ≡  Acknowledgments  ≡  Thanks  ≡  Dedication-and-Acknowledgements (UK/US spelling both fine).",
+      "  - Table of Contents  ≡  Contents  ≡  TOC.",
+      "  - Table of Figures  ≡  List of Figures  ≡  Figures.",
+      "  - Table of Tables  ≡  List of Tables  ≡  Tables.",
+      "  - List of Abbreviations  ≡  Abbreviations  ≡  Acronyms  ≡  Glossary (if used as abbreviation list).",
+      "  - Introduction  ≡  Background and Introduction  ≡  Project Introduction.",
+      "  - Literature Review  ≡  Background  ≡  Related Work  ≡  State of the Art.",
+      "  - Methodology  ≡  Methods  ≡  Approach  ≡  Research Method.",
+      "  - Design  ≡  System Design  ≡  Architecture  ≡  Solution Design.",
+      "  - Implementation  ≡  Development  ≡  Build  ≡  Realisation.",
+      "  - Testing  ≡  Evaluation  ≡  Validation  ≡  Quality Assurance (when paired with test cases).",
+      "  - Conclusion  ≡  Conclusions  ≡  Summary and Conclusion  ≡  Discussion and Conclusion.",
+      "  - Future Work  ≡  Future Enhancements  ≡  Future Scope  ≡  Recommendations.",
+      "  - Appendix  ≡  Appendices  ≡  Annex  ≡  Annexure.",
+      "",
+      "General matching rules (apply BEFORE concluding a section is missing):",
+      "  1. Normalize headings before comparison: lowercase, strip punctuation, strip numbering prefixes (e.g. '1.', '1.2.3', 'Chapter 4 —', 'Section II:'), strip 'and', '&', trailing colon, surrounding whitespace, and trailing 's'.",
+      "  2. Compare as TOKEN SETS: if every meaningful word in the template heading appears in some report heading (or vice-versa, when the report uses a more specific title like 'Background and Introduction' vs template 'Introduction'), treat them as the same section.",
+      "  3. Look BEYOND headings for sections that often appear as images or boilerplate: cover page, declaration sheet, certificate, signature block. Scan the first ~2 pages of text for indicative keywords (university name, 'declare', 'submitted by', 'supervisor', 'date', 'signature') before flagging these as missing.",
+      "  4. NUMBERING IS NOT STRUCTURAL — DO NOT compare or flag chapter/section NUMBERS between template and report. If template has '1. Introduction / 2. Literature Review / 3. Methodology' and the report uses '1. Introduction / 2. Methodology / 3. Literature Review', that is NOT a structure violation — both sections exist. Same for '3.2.1' vs 'III.B.1' style differences. Only flag missing/extra sections by ROLE, not by numbering scheme.",
+      "  5. Order of optional sections (Bibliography vs References, Acknowledgements vs Abstract) is NOT a violation. Only flag order when a clearly mandatory anchor section (e.g. Conclusion before References) is out of place in a way that breaks reading flow.",
+      "  6. If unsure whether a section is present, DO NOT flag — false missing-section claims are the worst class of reviewer noise per the team. Bias towards 'present' when there is any plausible signal.",
+      "",
+      "When flagging a TRUE missing section, follow the structure-compliance skill format: severity CRITICAL, category FORMAT, quotedText = the missing heading from the template, shortDescription = `Missing required section [TITLE] — required by the template.`. Do NOT include numbering in quotedText.",
+    ].join("\n"),
+  },
   {
     id: "structure-compliance",
     name: "Structure compliance",
@@ -23,10 +74,12 @@ export const SKILLS: SkillDef[] = [
     defaultOn: true,
     instructions: [
       "Skill: STRUCTURE COMPLIANCE (report format vs template) — CRITICAL ENFORCEMENT.",
-      "- BUILD an explicit checklist of every heading and required subsection from the template before reading the report. Walk the checklist top-to-bottom and verify each item is present somewhere in the report with matching role + meaningful body content (not the same words, the same KIND of section).",
-      "- Flag EACH missing required section / required subsection as a SEPARATE CRITICAL · FORMAT issue. quotedText = the missing heading text from the template. shortDescription = `Missing required section [TITLE] — required by the template.`",
-      "- Also flag, with appropriate severity: out-of-order sections, heading-numbering scheme inconsistent with the template, mismatched figure/table caption style, citation format mismatched vs template, missing required boilerplate (declaration page, acknowledgements, table of figures) when the template includes one.",
+      "- BUILD an explicit checklist of every heading and required subsection from the template before reading the report. Walk the checklist top-to-bottom and verify each item is present somewhere in the report with matching ROLE (not the same words, the same KIND of section).",
+      "- Apply the FLEXIBLE SECTION MATCHING rules above when deciding presence. A section is present if its role exists in the report by heading, near-synonym, OR unheaded boilerplate block (cover page, declaration image, etc.). Do NOT rely on exact heading text.",
+      "- Flag EACH genuinely missing required section / required subsection as a SEPARATE CRITICAL · FORMAT issue. quotedText = the missing heading text from the template (no numbering prefix). shortDescription = `Missing required section [TITLE] — required by the template.`",
+      "- Also flag, with appropriate severity: mismatched figure/table caption style, citation format mismatched vs template, missing required boilerplate when the template includes one and NO equivalent block is present anywhere in the report.",
       "- If a section heading exists but its body is missing or is a heading-only stub, that is STILL a structure violation — flag as CRITICAL · FORMAT with quotedText = the offending heading.",
+      "- DO NOT flag heading-numbering differences (e.g. template '1.2.3' vs report 'II.B.1') as a structure violation. Numbering scheme is presentational only — see FLEXIBLE SECTION MATCHING rule 4.",
       "- DO NOT flag a section because its body content TOPIC differs from the template — the template is a structural guide, not a topic match.",
       "- DO NOT suggest a fix. Depict the format break only and quote the heading so the reviewer can navigate to it.",
     ].join("\n"),
@@ -179,8 +232,15 @@ export function defaultSkillIds(): string[] {
 }
 
 export function buildSkillsSection(enabledIds: string[]): string {
-  const ids = enabledIds.length ? enabledIds : defaultSkillIds();
-  const blocks = ids
+  const base = enabledIds.length ? enabledIds : defaultSkillIds();
+  // Always-on skills (e.g. flexible-section-matching) ride along on every
+  // review, even when the report's stored enabledSkills predates them.
+  const alwaysOn = SKILLS.filter((s) => s.alwaysOn).map((s) => s.id);
+  const merged: string[] = [];
+  for (const id of [...alwaysOn, ...base]) {
+    if (!merged.includes(id)) merged.push(id);
+  }
+  const blocks = merged
     .map((id) => getSkill(id))
     .filter((s): s is SkillDef => !!s)
     .map((s) => s.instructions);

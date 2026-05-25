@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import dynamic from "next/dynamic";
 import { countMajorWords } from "@/lib/checks/majorContent";
+import { explainPresence } from "@/lib/agent/sectionGroups";
 
 const PdfReportViewer = dynamic(() => import("./PdfReportViewer"), { ssr: false, loading: () => <div className="p-8 text-zinc-500 text-sm">Loading PDF viewer…</div> });
 
@@ -164,7 +165,7 @@ export default function ReportViewer({ report, issues: initialIssues, templates 
   const [searchHits, setSearchHits] = useState(0);
   const [searchActive, setSearchActive] = useState(0);
   const [reviewMode, setReviewMode] = useState(report.reviewMode);
-  const [wordCountMin, setWordCountMin] = useState<number>(report.wordCountMin ?? 10000);
+  const [wordCountMin, setWordCountMin] = useState<number>(report.wordCountMin ?? 8000);
   const [wordCountMax, setWordCountMax] = useState<number>(report.wordCountMax ?? 12000);
   const [severityFilter, setSeverityFilter] = useState<"ALL" | "CRITICAL" | "MAJOR">("ALL");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -1185,18 +1186,10 @@ function SchemeModal({ scheme, loading, error, templateId, reportPlainText, onRe
   onRegenerate: () => void;
   onClose: () => void;
 }) {
-  // Lowercased report once so each topic-presence check is a cheap substring scan.
-  const reportLower = reportPlainText.toLowerCase();
-  const isPresent = (heading: string): boolean => {
-    const h = heading.toLowerCase().trim();
-    if (!h) return false;
-    // Whole-phrase match is most accurate, but PDF extraction often glues words
-    // together — fall back to a tokens-all-present match for short headings.
-    if (reportLower.includes(h)) return true;
-    const tokens = h.split(/\s+/).filter((t) => t.length > 2);
-    if (tokens.length >= 2 && tokens.every((t) => reportLower.includes(t))) return true;
-    return false;
-  };
+  // Synonym-aware presence check shared with the rule pass + LLM skill.
+  // Returns `{present, reason}` so the row tooltip can explain WHY a section
+  // is marked missing (which synonyms were searched, what counts as present).
+  const presenceFor = (heading: string) => explainPresence(heading, reportPlainText);
   return (
     <div
       className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
@@ -1252,18 +1245,19 @@ function SchemeModal({ scheme, loading, error, templateId, reportPlainText, onRe
                   </thead>
                   <tbody>
                     {scheme.topics.map((t: any, i: number) => {
-                      const present = isPresent(t.heading);
+                      const presence = presenceFor(t.heading);
+                      const present = presence.present;
                       return (
                         <tr key={t.id} className="border-b border-zinc-100">
                           <td className="py-1 text-zinc-500">{i + 1}</td>
-                          <td className="py-1" title={present ? "Heading found in the report" : "Not found in the report — check structure"}>
+                          <td className="py-1 cursor-help" title={presence.reason}>
                             {present ? (
                               <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 text-emerald-600" aria-label="present"><path fill="currentColor" d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm3.78 5.97a.75.75 0 0 0-1.06 0L7 9.69 5.28 7.97a.75.75 0 1 0-1.06 1.06l2.25 2.25c.3.3.77.3 1.06 0l4.25-4.25a.75.75 0 0 0 0-1.06Z"/></svg>
                             ) : (
                               <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 text-red-600" aria-label="missing"><path fill="currentColor" d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm2.78 4.22a.75.75 0 0 0-1.06 0L8 5.94 6.28 4.22a.75.75 0 1 0-1.06 1.06L6.94 7 5.22 8.72a.75.75 0 1 0 1.06 1.06L8 8.06l1.72 1.72a.75.75 0 1 0 1.06-1.06L9.06 7l1.72-1.72a.75.75 0 0 0 0-1.06Z"/></svg>
                             )}
                           </td>
-                          <td className="py-1">{t.heading}</td>
+                          <td className="py-1 cursor-help" title={presence.reason}>{t.heading}</td>
                           <td className="py-1 text-right tabular-nums">{t.weight} pts</td>
                           <td className="py-1 text-right text-zinc-500">{t.required ? "yes" : "no"}</td>
                         </tr>

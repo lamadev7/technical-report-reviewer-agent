@@ -93,7 +93,7 @@ function slugify(s: string): string {
 
 export function generateMarkingScheme({
   plainText,
-  wordCountMin = 10000,
+  wordCountMin = 8000,
   wordCountMax = 12000,
 }: {
   plainText: string;

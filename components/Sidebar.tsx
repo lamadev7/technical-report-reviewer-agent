@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { prisma } from "@/lib/db";
 import SidebarHistory from "./SidebarHistory";
+import ProviderBadge from "./ProviderBadge";
 
 export default async function Sidebar() {
   let reports: Array<{ id: string; studentName: string | null; filename: string; status: string }> = [];
@@ -28,9 +29,13 @@ export default async function Sidebar() {
         <Link href="/knowledge" className="rounded px-2 py-1.5 hover:bg-zinc-100">Knowledge Base</Link>
       </nav>
       <div className="mt-6 text-xs uppercase tracking-wide text-zinc-500">History</div>
-      <ul className="flex flex-col gap-0.5 overflow-y-auto text-sm">
+      <ul className="flex flex-col gap-0.5 overflow-y-auto text-sm flex-1">
         <SidebarHistory initial={items} />
       </ul>
+      <div className="mt-2 pt-2 border-t border-zinc-200">
+        <div className="mb-1 text-[10px] uppercase tracking-wide text-zinc-500">Active LLM</div>
+        <ProviderBadge />
+      </div>
     </aside>
   );
 }

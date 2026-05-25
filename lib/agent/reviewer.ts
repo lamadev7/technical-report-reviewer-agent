@@ -1,12 +1,41 @@
 import { prisma } from "@/lib/db";
-import { anthropic, MODEL } from "./anthropic";
-import { runClaudeCliJson, claudeCliAvailable, ClaudeCliError } from "./cli";
+import { getProvider } from "./llm";
+import type { LlmAttachment } from "./llm/types";
+import { load as loadStorage } from "@/lib/storage";
 import { REVIEW_SYSTEM_BASE, rubricFor, MARKING_SYSTEM_BASE, markingRubricFor, type Mode } from "./prompts";
 import { buildSkillsSection, defaultSkillIds } from "./skills";
 import { ReviewOutputSchema, MarkingOutputSchema, reviewToolSchema, markingToolSchema } from "./schema";
 import { publish, registerAbort, clearAbort, type ReviewProgress } from "./reviewBus";
 import { applyPassiveDeletionPenalty } from "./marking";
 import { buildLearnedRejectionBlob } from "./learning";
+
+// PDFs larger than this are skipped — Gemini caps inline data at 20MB, and
+// passing a huge document blows up latency. Most student reports are <5MB.
+const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+
+// Best-effort PDF load for multimodal providers. Returns null when no PDF is
+// available, the file is missing, or it exceeds the size cap — caller falls
+// back to text-only review.
+async function loadReportAttachment(
+  originalPath: string | null | undefined,
+): Promise<LlmAttachment | null> {
+  if (!originalPath || !originalPath.toLowerCase().endsWith(".pdf")) return null;
+  try {
+    const buf = await loadStorage(originalPath);
+    if (buf.length > MAX_ATTACHMENT_BYTES) {
+      console.warn(`Report PDF ${originalPath} (${buf.length} bytes) exceeds attachment cap — sending text-only`);
+      return null;
+    }
+    return {
+      mimeType: "application/pdf",
+      data: buf,
+      description: "student report PDF",
+    };
+  } catch (e: any) {
+    console.warn(`Failed to load report PDF ${originalPath} for attachment: ${e.message}`);
+    return null;
+  }
+}
 
 // Tokens for fuzzy matching. Strips punctuation, lowercases, collapses
 // whitespace. A new finding is considered a duplicate of a dismissed one when
@@ -77,10 +106,6 @@ function startProgressTicker(reportId: string, base: ReviewProgress, intervalMs 
   };
   const timer = setInterval(() => { void fire(); }, intervalMs);
   return () => clearInterval(timer);
-}
-
-function useCli(): boolean {
-  return !process.env.ANTHROPIC_API_KEY;
 }
 
 const MAX_REPORT_CHARS = 60_000; // ~15k tokens for 6k words; cap to keep prompt reasonable
@@ -264,206 +289,71 @@ async function runReview(reportId: string, signal: AbortSignal) {
   // Cross-report learnings — patterns the reviewer has rejected many times.
   const learnedBlob = await buildLearnedRejectionBlob();
 
+  const provider = getProvider();
+  const providerLabel = provider.name === "anthropic" ? "Claude" : provider.name === "codex" ? "Codex" : "Gemini";
+
+  // Multimodal providers (Anthropic SDK, Gemini) can ingest the original PDF
+  // directly so the agent SEES scanned declarations, signatures, and logo
+  // pages that text extraction misses. Codex (Chat Completions) and Anthropic
+  // CLI ignore the attachment silently — text-only fallback.
+  const supportsAttachments = provider.name === "anthropic" || provider.name === "gemini";
+  const reportAttachment = supportsAttachments
+    ? await loadReportAttachment(report.originalPath)
+    : null;
+  const attachmentNote = reportAttachment
+    ? "ATTACHED: full student report PDF (pages may include image-only sections — declarations, signature blocks, logos. Inspect them visually before flagging missing structural sections; see FLEXIBLE SECTION MATCHING)."
+    : "(no PDF attachment available — rely on extracted text only. DO NOT flag missing declarations or covers when text extraction may have skipped image-only pages.)";
+
   await setProgress(reportId, {
     stage: "agent-running",
     ruleCount: ruleIssues.length,
     startedAt: startedAt.toISOString(),
-    message: "Running semantic review (Claude)…",
+    message: `Running semantic review (${providerLabel})…`,
   });
 
-  // --- Route: CLI fallback if no API key set ---
-  if (useCli()) {
-    if (!claudeCliAvailable()) {
-      throw new Error("ANTHROPIC_API_KEY not set and `claude` CLI not found on PATH. Install Claude Code CLI or set ANTHROPIC_API_KEY in .env.");
-    }
-    const reviewUserPrompt = [
-      `Templates the report must follow:\n\n${templatesBlob || "(no templates provided)"}`,
-      `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`,
-      `Already-flagged issues from automated checks (DO NOT re-report these — focus on semantic problems they miss):\n${ruleBlob}`,
-      dismissedContext,
-      learnedBlob,
-      `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}`,
-      `\nReturn JSON only matching the schema. No prose, no markdown fences.`,
-    ].filter(Boolean).join("\n\n");
-    const reviewSystem = [
-      REVIEW_SYSTEM_BASE,
-      rubricFor(reviewMode),
-      skillsBlob,
-      `Output format: JSON only matching the provided schema. Do not call any tools.`,
-    ].filter(Boolean).join("\n\n");
-    let parsedCli: any;
-    const stopReviewTicker = startProgressTicker(reportId, {
-      stage: "agent-running",
-      ruleCount: ruleIssues.length,
-      startedAt: startedAt.toISOString(),
-      message: "Semantic review running (Claude CLI)",
-    });
-    try {
-      parsedCli = await runClaudeCliJson({
-        systemPrompt: reviewSystem,
-        userPrompt: reviewUserPrompt,
-        jsonSchema: reviewToolSchema.input_schema,
-        signal,
-      });
-    } catch (e: any) {
-      if (signal.aborted || isAbortError(e)) throw e;
-      throw new Error(`claude CLI review failed: ${e.message}${e instanceof ClaudeCliError && e.stderr ? `\n${e.stderr.slice(0, 300)}` : ""}`);
-    } finally {
-      stopReviewTicker();
-    }
-    if (signal.aborted) throw new Error("cancelled");
-    const parsed = ReviewOutputSchema.parse(parsedCli);
-    const dedupedCli = parsed.issues.filter(
-      (iss) =>
-        !isDismissedDuplicate(
-          { quotedText: iss.quotedText, shortDescription: iss.shortDescription },
-          dismissedIssues,
-        ),
-    );
-    const issueRecords = dedupedCli.map((iss) => {
-      let start = report.plainText.indexOf(iss.quotedText);
-      if (start < 0) {
-        const norm = iss.quotedText.replace(/\s+/g, " ").trim();
-        const idx = report.plainText.replace(/\s+/g, " ").indexOf(norm);
-        start = idx < 0 ? (iss.startOffset ?? 0) : idx;
-      }
-      const end = start + iss.quotedText.length;
-      return {
-        reportId,
-        startOffset: start,
-        endOffset: end,
-        quotedText: iss.quotedText,
-        severity: iss.severity,
-        category: iss.category,
-        shortDescription: iss.shortDescription,
-        source: "AGENT" as const,
-      };
-    });
-    // Atomic swap: replace prior AGENT issues with this run's parse. Keeps the
-    // sidebar populated mid-run and avoids a flicker of "no issues" on refresh.
-    await prisma.$transaction([
-      prisma.issue.deleteMany({ where: { reportId, source: "AGENT", deleted: false } }),
-      ...(issueRecords.length
-        ? [prisma.issue.createMany({ data: issueRecords })]
-        : []),
-    ]);
+  // --- Review call ---
+  const reviewSystemSegments = [
+    { text: REVIEW_SYSTEM_BASE, cache: true },
+    { text: rubricFor(reviewMode) },
+    ...(skillsBlob ? [{ text: skillsBlob }] : []),
+  ];
+  const reviewUserSegments = [
+    { text: `Templates the report must follow:\n\n${templatesBlob || "(no templates provided)"}`, cache: true },
+    { text: `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`, cache: true },
+    { text: attachmentNote },
+    { text: `Already-flagged issues from automated checks (DO NOT re-report — focus on semantic findings these miss):\n${ruleBlob}` },
+    { text: dismissedContext },
+    ...(learnedBlob ? [{ text: learnedBlob }] : []),
+    { text: `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}` },
+  ];
 
-    await setProgress(reportId, {
-      stage: "marking-running",
-      ruleCount: ruleIssues.length,
-      agentCount: issueRecords.length,
-      startedAt: startedAt.toISOString(),
-      message: "Computing marks…",
-    });
-
-    // Marking via CLI
-    const markingUserPrompt = [
-      `Templates:\n${templatesBlob || "(none)"}`,
-      `Samples:\n${samplesBlob || "(none)"}`,
-      `Student report:\n${reportText}`,
-      `\nReturn JSON only matching the schema. No prose, no markdown fences.`,
-    ].join("\n\n");
-    const markingSystem = [
-      MARKING_SYSTEM_BASE,
-      markingRubricFor(markingMode),
-      `Output format: a SINGLE JSON object — no prose, no markdown fences, no tool calls.`,
-      `Required shape:`,
-      `{"overall": <int 0-100>, "perSection": [{"title": "<section name>", "score": <int 0-100>, "note": "<optional short note>"} , ...]}`,
-      `Example:`,
-      `{"overall": 72, "perSection": [{"title": "Introduction", "score": 80, "note": "Clear scope"}, {"title": "Methodology", "score": 65, "note": "Missing tools justification"}, {"title": "Conclusion", "score": 70}]}`,
-      `Both "overall" and "perSection" are REQUIRED. perSection must have at least one item.`,
-    ].join("\n\n");
-    let marking: any = null;
-    const stopMarkingTicker = startProgressTicker(reportId, {
-      stage: "marking-running",
-      ruleCount: ruleIssues.length,
-      agentCount: issueRecords.length,
-      startedAt: startedAt.toISOString(),
-      message: "Computing marks (Claude CLI)",
-    });
-    try {
-      for (let attempt = 1; attempt <= 2 && !marking; attempt++) {
-        try {
-          const m = await runClaudeCliJson({
-            systemPrompt: markingSystem,
-            userPrompt: markingUserPrompt,
-            jsonSchema: markingToolSchema.input_schema,
-            timeoutMs: 180_000,
-            signal,
-          });
-          marking = MarkingOutputSchema.parse(m);
-        } catch (e: any) {
-          if (signal.aborted || isAbortError(e)) throw e;
-          console.warn(`claude CLI marking attempt ${attempt} failed:`, e.message);
-        }
-      }
-    } finally {
-      stopMarkingTicker();
-    }
-    if (signal.aborted) throw new Error("cancelled");
-    if (!marking) marking = await fallbackMarkingFromIssues(reportId);
-    marking = await applyPassiveDeletionPenalty(reportId, marking);
-    const finalCli: ReviewProgress = {
-      stage: "reviewed",
-      ruleCount: ruleIssues.length,
-      agentCount: issueRecords.length,
-      startedAt: startedAt.toISOString(),
-      steps: preflightSteps,
-    };
-    await prisma.report.update({
-      where: { id: reportId },
-      data: { status: "REVIEWED", marking, reviewProgress: finalCli as any },
-    });
-    publish(reportId, finalCli);
-    return { issueCount: issueRecords.length, marking, via: "cli" };
-  }
-
-  // --- Review call (SDK path) ---
-  const stopReviewTickerSdk = startProgressTicker(reportId, {
+  const stopReviewTicker = startProgressTicker(reportId, {
     stage: "agent-running",
     ruleCount: ruleIssues.length,
     startedAt: startedAt.toISOString(),
-    message: "Semantic review running (Claude SDK)",
+    message: `Semantic review running (${providerLabel}${reportAttachment ? " + PDF" : ""})`,
   });
-  let reviewMsg;
+  let reviewResult: { json: unknown; via: string };
   try {
-    reviewMsg = await anthropic().messages.create({
-      model: MODEL,
-      max_tokens: 8000,
-      system: [
-        { type: "text", text: REVIEW_SYSTEM_BASE, cache_control: { type: "ephemeral" } },
-        { type: "text", text: rubricFor(reviewMode) },
-        ...(skillsBlob ? [{ type: "text" as const, text: skillsBlob }] : []),
-      ],
-      tools: [reviewToolSchema as any],
-      tool_choice: { type: "tool", name: "report_issues" },
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: `Templates the report must follow:\n\n${templatesBlob || "(no templates provided)"}`, cache_control: { type: "ephemeral" } },
-            { type: "text", text: `Calibration samples:\n\n${samplesBlob || "(no samples provided)"}`, cache_control: { type: "ephemeral" } },
-            { type: "text", text: `Already-flagged issues from automated checks (DO NOT re-report — focus on semantic findings these miss):\n${ruleBlob}` },
-            { type: "text", text: dismissedContext },
-            ...(learnedBlob ? [{ type: "text" as const, text: learnedBlob }] : []),
-            { type: "text", text: `=== STUDENT REPORT (filename: ${report.filename}) ===\n${reportText}` },
-          ],
-        },
-      ],
-    }, { signal });
+    reviewResult = await provider.generateJson({
+      systemSegments: reviewSystemSegments,
+      userSegments: reviewUserSegments,
+      attachments: reportAttachment ? [reportAttachment] : undefined,
+      schemaName: reviewToolSchema.name,
+      schema: reviewToolSchema.input_schema,
+      maxTokens: 8000,
+      signal,
+    });
+  } catch (e: any) {
+    if (signal.aborted || isAbortError(e)) throw e;
+    throw new Error(`${providerLabel} review failed: ${e.message}`);
   } finally {
-    stopReviewTickerSdk();
+    stopReviewTicker();
   }
   if (signal.aborted) throw new Error("cancelled");
 
-  const reviewBlock = reviewMsg.content.find((b) => b.type === "tool_use");
-  if (!reviewBlock || reviewBlock.type !== "tool_use") throw new Error("Claude did not call report_issues tool");
-  const parsed = ReviewOutputSchema.parse(reviewBlock.input);
-
-  // Drop any finding Claude re-surfaced that the reviewer previously deleted
-  // — keeps dismissals sticky across reruns, even when token-saving prompt
-  // hints failed to convince the model.
-  const dedupedSdk = parsed.issues.filter(
+  const parsed = ReviewOutputSchema.parse(reviewResult.json);
+  const dedupedIssues = parsed.issues.filter(
     (iss) =>
       !isDismissedDuplicate(
         { quotedText: iss.quotedText, shortDescription: iss.shortDescription },
@@ -471,9 +361,8 @@ async function runReview(reportId: string, signal: AbortSignal) {
       ),
   );
 
-  // Snap offsets to actual occurrences of quotedText in report.plainText for higher accuracy
   const text = report.plainText;
-  const issueRecords = dedupedSdk.map((iss) => {
+  const issueRecords = dedupedIssues.map((iss) => {
     let start = text.indexOf(iss.quotedText);
     if (start < 0) {
       const norm = iss.quotedText.replace(/\s+/g, " ").trim();
@@ -493,7 +382,8 @@ async function runReview(reportId: string, signal: AbortSignal) {
     };
   });
 
-  // Atomic swap (see CLI path note above).
+  // Atomic swap: replace prior AGENT issues with this run's parse. Keeps the
+  // sidebar populated mid-run and avoids a flicker of "no issues" on refresh.
   await prisma.$transaction([
     prisma.issue.deleteMany({ where: { reportId, source: "AGENT", deleted: false } }),
     ...(issueRecords.length ? [prisma.issue.createMany({ data: issueRecords })] : []),
@@ -508,54 +398,50 @@ async function runReview(reportId: string, signal: AbortSignal) {
   });
 
   // --- Marking call ---
-  const stopMarkingTickerSdk = startProgressTicker(reportId, {
+  const markingSystemSegments = [
+    { text: MARKING_SYSTEM_BASE, cache: true },
+    { text: markingRubricFor(markingMode) },
+  ];
+  const markingUserSegments = [
+    { text: `Templates:\n${templatesBlob || "(none)"}`, cache: true },
+    { text: `Samples:\n${samplesBlob || "(none)"}`, cache: true },
+    { text: `Student report:\n${reportText}` },
+  ];
+
+  const stopMarkingTicker = startProgressTicker(reportId, {
     stage: "marking-running",
     ruleCount: ruleIssues.length,
     agentCount: issueRecords.length,
     startedAt: startedAt.toISOString(),
-    message: "Computing marks (Claude SDK)",
+    message: `Computing marks (${providerLabel})`,
   });
   let marking: any = null;
   try {
     for (let attempt = 1; attempt <= 2 && !marking; attempt++) {
       try {
-        const markingMsg = await anthropic().messages.create({
-          model: MODEL,
-          max_tokens: 1500,
-          system: [
-            { type: "text", text: MARKING_SYSTEM_BASE, cache_control: { type: "ephemeral" } },
-            { type: "text", text: markingRubricFor(markingMode) },
-          ],
-          tools: [markingToolSchema as any],
-          tool_choice: { type: "tool", name: "submit_marking" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: `Templates:\n${templatesBlob || "(none)"}`, cache_control: { type: "ephemeral" } },
-                { type: "text", text: `Samples:\n${samplesBlob || "(none)"}`, cache_control: { type: "ephemeral" } },
-                { type: "text", text: `Student report:\n${reportText}` },
-              ],
-            },
-          ],
-        }, { signal });
-        const markBlock = markingMsg.content.find((b) => b.type === "tool_use");
-        if (markBlock && markBlock.type === "tool_use") {
-          marking = MarkingOutputSchema.parse(markBlock.input);
-        }
+        const m = await provider.generateJson({
+          systemSegments: markingSystemSegments,
+          userSegments: markingUserSegments,
+          schemaName: markingToolSchema.name,
+          schema: markingToolSchema.input_schema,
+          maxTokens: 1500,
+          timeoutMs: 180_000,
+          signal,
+        });
+        marking = MarkingOutputSchema.parse(m.json);
       } catch (e: any) {
         if (signal.aborted || isAbortError(e)) throw e;
-        console.warn(`claude SDK marking attempt ${attempt} failed:`, e?.message || e);
+        console.warn(`${providerLabel} marking attempt ${attempt} failed:`, e?.message || e);
       }
     }
   } finally {
-    stopMarkingTickerSdk();
+    stopMarkingTicker();
   }
   if (signal.aborted) throw new Error("cancelled");
   if (!marking) marking = await fallbackMarkingFromIssues(reportId);
   marking = await applyPassiveDeletionPenalty(reportId, marking);
 
-  const finalSdk: ReviewProgress = {
+  const finalProgress: ReviewProgress = {
     stage: "reviewed",
     ruleCount: ruleIssues.length,
     agentCount: issueRecords.length,
@@ -564,11 +450,11 @@ async function runReview(reportId: string, signal: AbortSignal) {
   };
   await prisma.report.update({
     where: { id: reportId },
-    data: { status: "REVIEWED", marking, reviewProgress: finalSdk as any },
+    data: { status: "REVIEWED", marking, reviewProgress: finalProgress as any },
   });
-  publish(reportId, finalSdk);
+  publish(reportId, finalProgress);
 
-  return { issueCount: issueRecords.length, marking, via: "sdk" as const };
+  return { issueCount: issueRecords.length, marking, via: reviewResult.via };
 }
 
 function truncate(s: string, max: number) {
